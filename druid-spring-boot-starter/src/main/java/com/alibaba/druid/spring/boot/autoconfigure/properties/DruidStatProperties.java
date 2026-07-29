@@ -25,7 +25,7 @@ public class DruidStatProperties {
     private String[] aopPatterns;
     private StatViewServlet statViewServlet = new StatViewServlet();
     private WebStatFilter webStatFilter = new WebStatFilter();
-
+    private Prometheus prometheus = new Prometheus();
 
     public String[] getAopPatterns() {
         return aopPatterns;
@@ -49,6 +49,14 @@ public class DruidStatProperties {
 
     public void setWebStatFilter(WebStatFilter webStatFilter) {
         this.webStatFilter = webStatFilter;
+    }
+
+    public Prometheus getPrometheus() {
+        return prometheus;
+    }
+
+    public void setPrometheus(Prometheus prometheus) {
+        this.prometheus = prometheus;
     }
 
     public static class StatViewServlet {
@@ -117,6 +125,96 @@ public class DruidStatProperties {
 
         public void setResetEnable(String resetEnable) {
             this.resetEnable = resetEnable;
+        }
+    }
+
+    /**
+     * Prometheus metrics export configuration.
+     */
+    public static class Prometheus {
+        /**
+         * Enable Prometheus metrics export.
+         */
+        private boolean enabled = false;
+        /**
+         * URL mapping of the Prometheus scrape endpoint.
+         */
+        private String urlPattern = "/actuator/prometheus";
+        /**
+         * Enable basic connection pool metrics.
+         */
+        private boolean basic = true;
+        /**
+         * Enable datasource metrics.
+         */
+        private boolean datasource = true;
+        /**
+         * Enable SQL metrics.
+         */
+        private boolean sql = true;
+        /**
+         * Enable web URI metrics.
+         */
+        private boolean weburi = true;
+        /**
+         * Enable web session metrics.
+         */
+        private boolean websession = true;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public String getUrlPattern() {
+            return urlPattern;
+        }
+
+        public void setUrlPattern(String urlPattern) {
+            this.urlPattern = urlPattern;
+        }
+
+        public boolean isBasic() {
+            return basic;
+        }
+
+        public void setBasic(boolean basic) {
+            this.basic = basic;
+        }
+
+        public boolean isDatasource() {
+            return datasource;
+        }
+
+        public void setDatasource(boolean datasource) {
+            this.datasource = datasource;
+        }
+
+        public boolean isSql() {
+            return sql;
+        }
+
+        public void setSql(boolean sql) {
+            this.sql = sql;
+        }
+
+        public boolean isWeburi() {
+            return weburi;
+        }
+
+        public void setWeburi(boolean weburi) {
+            this.weburi = weburi;
+        }
+
+        public boolean isWebsession() {
+            return websession;
+        }
+
+        public void setWebsession(boolean websession) {
+            this.websession = websession;
         }
     }
 

@@ -1,247 +1,120 @@
-# Druid Prometheus Metrics Integration
+# Druid Prometheus Metrics
 
-This document describes how to use the Prometheus metrics integration in Druid Spring Boot Starter.
+The Druid Spring Boot Starter can expose Druid statistics directly in the
+Prometheus text format. Spring Boot Actuator, Micrometer, and the standalone
+`druid2prom` process are not required.
 
-## Overview
-
-The Druid Prometheus metrics integration allows you to expose Druid database connection pool statistics as Prometheus metrics. This enables monitoring and alerting on your database performance using Prometheus and Grafana.
-
-## Configuration
-
-### 1. Enable Prometheus Metrics
-
-Add the following configuration to your `application.properties` or `application.yml`:
+## Enable the endpoint
 
 ```properties
-# Enable Prometheus metrics
 spring.datasource.druid.prometheus.enabled=true
-
-# Enable actuator
-spring.datasource.druid.actuator.enabled=true
 ```
 
-### 2. Configure Metrics Types
+The default scrape URL is:
 
-You can enable specific types of metrics:
+```text
+http://localhost:8080/actuator/prometheus
+```
+
+The URL and metric groups can be configured independently:
 
 ```properties
-# Enable all metrics types
-spring.datasource.druid.actuator.basic=true
-spring.datasource.druid.actuator.datasource=true
-spring.datasource.druid.actuator.sql=true
-spring.datasource.druid.actuator.weburi=true
-spring.datasource.druid.actuator.websession=true
+spring.datasource.druid.prometheus.url-pattern=/actuator/prometheus
+spring.datasource.druid.prometheus.basic=true
+spring.datasource.druid.prometheus.datasource=true
+spring.datasource.druid.prometheus.sql=true
+spring.datasource.druid.prometheus.weburi=true
+spring.datasource.druid.prometheus.websession=true
 ```
 
-### 3. Actuator Configuration
+Prometheus export is disabled by default. All metric groups default to enabled
+after the endpoint itself is enabled.
 
-Make sure Spring Boot Actuator is properly configured:
+SQL metrics require Druid's stat filter. URI and session metrics require the
+web stat filter:
 
 ```properties
-# Expose all actuator endpoints
-management.endpoints.web.exposure.include=*
-
-# Show details in health endpoint
-management.endpoint.health.show-details=always
+spring.datasource.druid.filter.stat.enabled=true
+spring.datasource.druid.web-stat-filter.enabled=true
+spring.datasource.druid.web-stat-filter.exclusions=*.js,*.gif,*.jpg,*.png,*.css,*.ico,/druid/*,/actuator/prometheus
 ```
 
-## Available Metrics
+When a custom scrape URL is used, add that URL to the web-stat exclusions to
+avoid counting Prometheus scrapes as application requests.
 
-### Basic Metrics
-- `druid_basic_active_connections`: Number of active connections
-- `druid_basic_pool_connections`: Number of connections in the pool
-- `druid_basic_pool_max_connections`: Maximum number of connections in the pool
-- `druid_basic_execute_count`: Number of SQL executions (Counter)
-- `druid_basic_error_count`: Number of SQL execution errors (Counter)
-- `druid_basic_commit_count`: Number of transaction commits (Counter)
-- `druid_basic_rollback_count`: Number of transaction rollbacks (Counter)
-- `druid_basic_wait_thread_count`: Number of threads waiting for a connection
-- `druid_basic_not_idle_connection_count`: Number of times that a connection was requested but no idle connection was available
+## druid2prom-compatible metrics
 
-### DataSource Metrics
-- `druid_datasource_count`: Number of data sources
-- `druid_datasource_pool_connections`: Number of connections in the pool (per datasource)
-- `druid_datasource_active_connections`: Number of active connections (per datasource)
+The embedded exporter preserves the 19 metric families, names, labels, MD5
+calculation, and bucket labels used by `druid2prom`.
 
-### SQL Metrics
-- `druid_sql_execute_count_total`: Total number of SQL executions (Counter)
-- `druid_sql_error_count_total`: Total number of SQL execution errors (Counter)
-- `druid_sql_execute_time_total`: Total SQL execution time (Distribution Summary)
-- `druid_sql_execute_count`: Number of SQL executions (per datasource, SQL type, SQL MD5)
-- `druid_sql_execute_time`: SQL execution time (Timer)
-- `druid_sql_duration`: SQL duration distribution (Distribution Summary)
-- `druid_sql_error_count`: SQL execution errors (Counter)
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `druid_uri_request_count_sum` | counter | `uri` |
+| `druid_uri_request_time_sum` | counter | `uri` |
+| `druid_uri_request_time_max` | gauge | `uri` |
+| `druid_uri_request_time_avg` | gauge | `uri` |
+| `druid_uri_request_time_histogram` | counter | `uri`, `max` |
+| `druid_uri_jdbc_execute_time_peak` | gauge | `uri` |
+| `druid_uri_jdbc_fetch_row_peak` | gauge | `uri` |
+| `druid_uri_jdbc_effect_row_peak` | gauge | `uri` |
+| `druid_sql_execute_count_sum` | counter | `sql` |
+| `druid_sql_execute_time_sum` | counter | `sql` |
+| `druid_sql_execute_time_max` | gauge | `sql` |
+| `druid_sql_execute_time_avg` | gauge | `sql` |
+| `druid_sql_execute_time_histogram` | counter | `sql`, `max` |
+| `druid_sql_effect_row_sum` | counter | `sql` |
+| `druid_sql_effect_row_max` | gauge | `sql` |
+| `druid_sql_effect_row_histogram` | counter | `sql`, `max` |
+| `druid_sql_fetch_row_sum` | counter | `sql` |
+| `druid_sql_fetch_row_max` | gauge | `sql` |
+| `druid_sql_fetch_row_histogram` | counter | `sql`, `max` |
 
-### Web URI Metrics
-- `druid_uri_request_count`: Total number of URI requests
-- `druid_uri_request_time`: URI request time
-- `druid_uri_request_time_histogram`: URI request time distribution
+The `sql` label is the lowercase MD5 of the UTF-8 SQL text. The original SQL
+remains available from Druid's SQL statistics page and `/druid/sql.json`.
 
-### Web Session Metrics
-- `druid_websession_active_count`: Number of active web sessions
-- `druid_websession_session_count`: Total number of web sessions
+The exporter also provides optional basic, datasource, and web-session gauges:
 
-## Labels and Tags
+- `druid_active_connections`
+- `druid_pooling_connections`
+- `druid_pooling_max_connections`
+- `druid_execute_count`
+- `druid_error_count`
+- `druid_commit_count`
+- `druid_rollback_count`
+- `druid_wait_thread_count`
+- `druid_not_empty_wait_count`
+- `druid_datasource_count`
+- `druid_datasource_active_connections`
+- `druid_datasource_pooling_connections`
+- `druid_websession_active_count`
+- `druid_websession_session_count`
 
-### SQL Metrics Labels
-- `datasource`: Datasource name
-- `sql_md5`: MD5 hash of the SQL statement (for identification)
-- `sql_type`: Type of SQL (select, insert, update, delete, etc.)
-
-### DataSource Metrics Labels
-- `datasource_name`: Datasource name
-- `datasource_url`: Datasource URL
-
-## Example Configuration
-
-```properties
-# Complete configuration example
-spring:
-  datasource:
-    druid:
-      # Basic datasource configuration
-      url: jdbc:mysql://localhost:3306/mydb
-      username: myuser
-      password: mypassword
-      driver-class-name: com.mysql.cj.jdbc.Driver
-
-      # Pool configuration
-      initial-size: 5
-      min-idle: 5
-      max-active: 20
-      max-wait: 60000
-
-      # Enable Prometheus metrics
-      prometheus:
-        enabled: true
-
-      # Enable actuator and metrics
-      actuator:
-        enabled: true
-        basic: true
-        datasource: true
-        sql: true
-        weburi: true
-        websession: true
-
-      # Stat view servlet (optional)
-      stat-view-servlet:
-        enabled: true
-        url-pattern: /druid/*
-        allow: 127.0.0.1
-        login-username: admin
-        login-password: admin
-
-      # Web stat filter (optional)
-      web-stat-filter:
-        enabled: true
-        url-pattern: /*
-        exclusions: *.js,*.gif,*.jpg,*.png,*.css,*.ico,/druid/*
-
-# Actuator configuration
-management:
-  endpoints:
-    web:
-      exposure:
-        include: *
-  endpoint:
-    health:
-      show-details: always
-```
-
-## Prometheus Configuration
-
-Add the following to your `prometheus.yml`:
+## Prometheus configuration
 
 ```yaml
 scrape_configs:
-  - job_name: 'druid'
-    scrape_interval: 15s
+  - job_name: druid
     static_configs:
-      - targets: ['localhost:8080']
+      - targets: ["localhost:8080"]
     metrics_path: /actuator/prometheus
 ```
 
-## Grafana Dashboard
+The scrape endpoint intentionally contains no raw SQL, datasource URL,
+credentials, or stack traces. URI values are escaped according to the
+Prometheus text format. As with any monitoring endpoint, restrict access at the
+network or application security layer when the service is not on a trusted
+network.
 
-You can use the following queries in Grafana to visualize the metrics:
+Unlike the original standalone exporter, scraping does not call
+`/druid/reset-all.json`. Resetting cumulative values during collection would
+make Prometheus counters discontinuous and would mutate application monitoring
+state.
 
-### Connection Pool Metrics
-```
-# Active connections
-druid_basic_active_connections
-
-# Pool utilization
-druid_basic_pool_connections / druid_basic_pool_max_connections
-
-# SQL execution rate
-rate(druid_basic_execute_count[5m])
-
-# Error rate
-rate(druid_basic_error_count[5m])
-```
-
-### SQL Performance Metrics
-```
-# Slow queries
-topk(10, druid_sql_duration_sum{datasource="$datasource"} / druid_sql_duration_count{datasource="$datasource"})
-
-# SQL type distribution
-sum(rate(druid_sql_execute_count{sql_type="$type"}[5m])) by (sql_type)
-
-# Error rate by SQL
-topk(10, rate(druid_sql_error_count[5m])) by (sql_md5, datasource)
-```
-
-### Web Performance Metrics
-```
-# Request rate
-rate(druid_uri_request_count[5m])
-
-# Average response time
-sum(rate(druid_uri_request_time_sum[5m])) / sum(rate(druid_uri_request_count[5m]))
-
-# Slow URIs
-topk(10, druid_uri_request_time_histogram_sum) by (uri)
-```
-
-## Troubleshooting
-
-### 1. Metrics Not Appearing
-
-Check the following:
-- Ensure `spring.datasource.druid.prometheus.enabled=true` is set
-- Verify that the actuator endpoint is accessible at `/actuator/prometheus`
-- Check the logs for any errors during metric registration
-
-### 2. Missing SQL MD5 Tags
-
-If you don't see SQL MD5 tags, ensure that:
-- SQL statements are being collected by the stat filter
-- The SQL statements are not empty or null
-
-### 3. High Cardinality Issues
-
-If you encounter high cardinality issues with SQL MD5 tags:
-- Consider using a sampling rate or filtering specific SQL types
-- Use `sql_md5` label in Prometheus queries to aggregate by SQL statement
-
-### 4. Performance Impact
-
-The metrics collection has minimal performance impact. If you notice performance issues:
-- Consider disabling some metrics types that you don't need
-- Adjust the scrape interval in Prometheus
-
-## Testing
-
-You can test the metrics by running the example application:
+## Quick check
 
 ```bash
-# Run with Prometheus configuration
-mvn spring-boot:run -Dspring-boot.run.properties=classpath:application-prometheus.properties
-
-# Access the metrics endpoint
 curl http://localhost:8080/actuator/prometheus
 ```
 
-The response should contain all the Druid metrics in Prometheus format.
+Each scrape reads each enabled Druid JSON endpoint no more than once, so the
+work is linear in the number of SQL and URI statistic entries.
