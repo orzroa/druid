@@ -16,36 +16,25 @@
 package com.alibaba.druid.spring.boot.autoconfigure.stat;
 
 import com.alibaba.druid.spring.boot.autoconfigure.properties.DruidStatProperties;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
-import org.springframework.boot.web.servlet.ServletRegistrationBean;
 import org.springframework.context.annotation.Bean;
 
 /**
- * Registers an embedded Prometheus scrape endpoint for Druid statistics.
+ * Registers Druid metrics in the application's existing Micrometer registry.
  *
  * @author druid
  */
-@ConditionalOnWebApplication
+@ConditionalOnClass(MeterRegistry.class)
 @ConditionalOnProperty(name = "spring.datasource.druid.prometheus.enabled", havingValue = "true")
 public class DruidPrometheusMetricsConfiguration {
-    static final String DEFAULT_URL_PATTERN = "/actuator/prometheus";
-
     @Bean
-    public ServletRegistrationBean druidPrometheusServletRegistrationBean(DruidStatProperties properties) {
-        DruidStatProperties.Prometheus config = properties.getPrometheus();
-        ServletRegistrationBean registrationBean = new ServletRegistrationBean();
-        registrationBean.setName("druidPrometheusMetricsServlet");
-        registrationBean.setServlet(new DruidPrometheusMetricsServlet(new DruidPrometheusMetricsExporter(config)));
-        registrationBean.addUrlMappings(normalizeUrlPattern(config.getUrlPattern()));
-        return registrationBean;
-    }
-
-    static String normalizeUrlPattern(String urlPattern) {
-        if (urlPattern == null || urlPattern.trim().isEmpty()) {
-            return DEFAULT_URL_PATTERN;
-        }
-        String normalized = urlPattern.trim();
-        return normalized.charAt(0) == '/' ? normalized : "/" + normalized;
+    @ConditionalOnMissingBean
+    public DruidPrometheusMetricsExporter druidPrometheusMetricsExporter(
+            DruidStatProperties properties, ObjectProvider<MeterRegistry> meterRegistryProvider) {
+        return new DruidPrometheusMetricsExporter(properties.getPrometheus(), meterRegistryProvider);
     }
 }

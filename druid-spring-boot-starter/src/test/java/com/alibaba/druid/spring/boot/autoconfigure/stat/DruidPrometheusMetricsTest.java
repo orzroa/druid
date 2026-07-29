@@ -16,22 +16,29 @@
 package com.alibaba.druid.spring.boot.autoconfigure.stat;
 
 import com.alibaba.druid.spring.boot.autoconfigure.properties.DruidStatProperties;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.Meter;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.micrometer.prometheus.PrometheusConfig;
+import io.micrometer.prometheus.PrometheusMeterRegistry;
 import org.junit.Before;
 import org.junit.Test;
-import org.springframework.mock.web.MockHttpServletRequest;
-import org.springframework.mock.web.MockHttpServletResponse;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 
 public class DruidPrometheusMetricsTest {
     private static final String HASH = "f15e5e09c27c92be6ed2b586d171d68a";
 
     private DruidStatProperties.Prometheus config;
+    private SimpleMeterRegistry registry;
     private StubStatService statService;
 
     @Before
@@ -42,10 +49,195 @@ public class DruidPrometheusMetricsTest {
         config.setWebsession(false);
         config.setSql(true);
         config.setWeburi(true);
-
+        registry = new SimpleMeterRegistry();
         statService = new StubStatService();
+        addDruid2PromFixtures();
+    }
+
+    @Test
+    public void testAllDruid2PromMetricFamiliesAndValuesAreRegistered() {
+        exporter().refresh();
+
+        String[] metricFamilies = {
+                "druid_uri_request_count_sum",
+                "druid_uri_request_time_sum",
+                "druid_uri_request_time_max",
+                "druid_uri_request_time_avg",
+                "druid_uri_request_time_histogram",
+                "druid_uri_jdbc_execute_time_peak",
+                "druid_uri_jdbc_fetch_row_peak",
+                "druid_uri_jdbc_effect_row_peak",
+                "druid_sql_execute_count_sum",
+                "druid_sql_execute_time_sum",
+                "druid_sql_execute_time_max",
+                "druid_sql_execute_time_avg",
+                "druid_sql_execute_time_histogram",
+                "druid_sql_effect_row_sum",
+                "druid_sql_effect_row_max",
+                "druid_sql_effect_row_histogram",
+                "druid_sql_fetch_row_sum",
+                "druid_sql_fetch_row_max",
+                "druid_sql_fetch_row_histogram"
+        };
+        Set<String> names = new HashSet<String>();
+        for (Meter meter : registry.getMeters()) {
+            names.add(meter.getId().getName());
+        }
+        for (String family : metricFamilies) {
+            assertNotNull("Missing metric family " + family, registry.find(family).meter());
+        }
+        assertEquals(19, names.size());
+
+        assertGauge(4, "druid_sql_execute_count_sum", "sql", HASH);
+        assertGauge(2.5, "druid_sql_execute_time_avg", "sql", HASH);
+        assertGauge(8, "druid_sql_execute_time_histogram",
+                "sql", HASH, "max", "10000");
+        assertGauge(4, "druid_sql_effect_row_histogram",
+                "sql", HASH, "max", "99999");
+        assertGauge(9, "druid_sql_fetch_row_histogram",
+                "sql", HASH, "max", "99999");
+        assertGauge(4, "druid_uri_request_count_sum", "uri", "/api/test");
+        assertGauge(2.5, "druid_uri_request_time_avg", "uri", "/api/test");
+    }
+
+    @Test
+    public void testEachDruidEndpointIsReadOnlyOncePerRefresh() {
+        exporter().refresh();
+
+        assertEquals(1, statService.calls("/sql.json"));
+        assertEquals(1, statService.calls("/weburi.json"));
+        assertEquals(0, statService.calls("/datasource.json"));
+        assertEquals(0, statService.calls("/websession.json"));
+    }
+
+    @Test
+    public void testBasicAndDatasourceMetricsAreAggregated() {
+        config.setSql(false);
+        config.setWeburi(false);
+        config.setBasic(true);
+        config.setDatasource(true);
+        statService.add("/datasource.json", result("["
+                + "{\"ActiveCount\":2,\"PoolingCount\":3,\"MaxActive\":10,"
+                + "\"ExecuteCount\":20,\"ErrorCount\":1,\"CommitCount\":4,"
+                + "\"RollbackCount\":2,\"WaitThreadCount\":1,\"NotEmptyWaitCount\":5},"
+                + "{\"ActiveCount\":1,\"PoolingCount\":4,\"MaxActive\":20,"
+                + "\"ExecuteCount\":30,\"ErrorCount\":2,\"CommitCount\":6,"
+                + "\"RollbackCount\":3,\"WaitThreadCount\":2,\"NotEmptyWaitCount\":7}"
+                + "]"));
+
+        exporter().refresh();
+
+        assertGauge(3, "druid_active_connections");
+        assertGauge(7, "druid_pooling_connections");
+        assertGauge(30, "druid_pooling_max_connections");
+        assertGauge(50, "druid_execute_count");
+        assertGauge(2, "druid_datasource_count");
+        assertGauge(3, "druid_datasource_active_connections");
+        assertEquals(1, statService.calls("/datasource.json"));
+    }
+
+    @Test
+    public void testZeroCountsAndShortHistogramsProduceValidValues() {
         statService.add("/weburi.json", result("[{"
-                + "\"URI\":\"/api/\\\"quoted\\\\path\\nnext\","
+                + "\"URI\":\"/empty\",\"RequestCount\":0,"
+                + "\"RequestTimeMillis\":10,\"Histogram\":[3]}]"));
+        statService.add("/sql.json", result("[{"
+                + "\"SQL\":\"SELECT 1\",\"ExecuteCount\":0,"
+                + "\"ExecuteAndResultSetHoldTime\":10,"
+                + "\"ExecuteAndResultHoldTimeHistogram\":[]}]"));
+
+        exporter().refresh();
+
+        assertGauge(0, "druid_uri_request_time_avg", "uri", "/empty");
+        assertGauge(0, "druid_uri_request_time_histogram",
+                "uri", "/empty", "max", "0.01");
+        assertGauge(0, "druid_sql_execute_time_avg",
+                "sql", "b1698e52a0f16203489454196a0c6307");
+    }
+
+    @Test
+    public void testMalformedResponseKeepsLastGoodValues() {
+        DruidPrometheusMetricsExporter exporter = exporter();
+        exporter.refresh();
+        statService.add("/sql.json", "not-json");
+
+        exporter.refresh();
+
+        assertGauge(4, "druid_sql_execute_count_sum", "sql", HASH);
+    }
+
+    @Test
+    public void testDisappearedDynamicSeriesAreRemoved() {
+        DruidPrometheusMetricsExporter exporter = exporter();
+        exporter.refresh();
+        statService.add("/sql.json", result("[]"));
+
+        exporter.refresh();
+
+        assertNull(registry.find("druid_sql_execute_count_sum").tag("sql", HASH).meter());
+        assertNotNull(registry.find("druid_uri_request_count_sum").tag("uri", "/api/test").meter());
+    }
+
+    @Test
+    public void testDestroyRemovesOnlyOwnedMeters() {
+        Gauge external = Gauge.builder("external_metric", new AtomicNumber(7),
+                value -> value.value).register(registry);
+        DruidPrometheusMetricsExporter exporter = exporter();
+        exporter.refresh();
+
+        exporter.destroy();
+
+        assertNotNull(registry.find("external_metric").meter());
+        assertEquals(7, external.value(), 0);
+        assertNull(registry.find("druid_sql_execute_count_sum").meter());
+    }
+
+    @Test
+    public void testExistingBusinessMetricIsNotOverwrittenOrRemoved() {
+        AtomicNumber existingValue = new AtomicNumber(99);
+        Gauge existing = Gauge.builder("druid_sql_execute_count_sum", existingValue,
+                value -> value.value).tag("sql", HASH).register(registry);
+        DruidPrometheusMetricsExporter exporter = exporter();
+
+        exporter.refresh();
+        exporter.destroy();
+
+        assertEquals(99, existing.value(), 0);
+        assertNotNull(registry.find("druid_sql_execute_count_sum").tag("sql", HASH).meter());
+    }
+
+    @Test
+    public void testPrometheusRegistryScrapeContainsDruidMetrics() {
+        PrometheusMeterRegistry prometheusRegistry =
+                new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
+        DruidPrometheusMetricsExporter exporter =
+                new DruidPrometheusMetricsExporter(config, prometheusRegistry, statService);
+
+        exporter.refresh();
+        String scrape = prometheusRegistry.scrape();
+
+        assertNotNull(prometheusRegistry.find("druid_sql_execute_count_sum")
+                .tag("sql", HASH).gauge());
+        org.junit.Assert.assertTrue(scrape.contains(
+                "druid_sql_execute_count_sum{sql=\"" + HASH + "\",} 4.0"));
+        org.junit.Assert.assertTrue(scrape.contains(
+                "druid_uri_request_count_sum{uri=\"/api/test\",} 4.0"));
+    }
+
+    private DruidPrometheusMetricsExporter exporter() {
+        return new DruidPrometheusMetricsExporter(config, registry, statService);
+    }
+
+    private void assertGauge(double expected, String name, String... tags) {
+        Gauge gauge = registry.find(name).tags(tags).gauge();
+        assertNotNull("Missing gauge " + name, gauge);
+        assertFalse("Gauge must not be NaN: " + name, Double.isNaN(gauge.value()));
+        assertEquals(expected, gauge.value(), 0.000001);
+    }
+
+    private void addDruid2PromFixtures() {
+        statService.add("/weburi.json", result("[{"
+                + "\"URI\":\"/api/test\","
                 + "\"RequestCount\":4,"
                 + "\"RequestTimeMillis\":10,"
                 + "\"RequestTimeMillisMax\":7,"
@@ -69,150 +261,16 @@ public class DruidPrometheusMetricsTest {
                 + "}]"));
     }
 
-    @Test
-    public void testAllDruid2PromMetricFamiliesAndValuesAreExported() {
-        String metrics = new DruidPrometheusMetricsExporter(config, statService).scrape();
-
-        String[] metricFamilies = {
-                "druid_uri_request_count_sum",
-                "druid_uri_request_time_sum",
-                "druid_uri_request_time_max",
-                "druid_uri_request_time_avg",
-                "druid_uri_request_time_histogram",
-                "druid_uri_jdbc_execute_time_peak",
-                "druid_uri_jdbc_fetch_row_peak",
-                "druid_uri_jdbc_effect_row_peak",
-                "druid_sql_execute_count_sum",
-                "druid_sql_execute_time_sum",
-                "druid_sql_execute_time_max",
-                "druid_sql_execute_time_avg",
-                "druid_sql_execute_time_histogram",
-                "druid_sql_effect_row_sum",
-                "druid_sql_effect_row_max",
-                "druid_sql_effect_row_histogram",
-                "druid_sql_fetch_row_sum",
-                "druid_sql_fetch_row_max",
-                "druid_sql_fetch_row_histogram"
-        };
-        for (String family : metricFamilies) {
-            assertTrue("Missing metric family " + family,
-                    metrics.contains("# TYPE " + family + " "));
-        }
-        assertEquals(19, count(metrics, "# TYPE druid_"));
-
-        assertTrue(metrics.contains("druid_sql_execute_count_sum{sql=\"" + HASH + "\"} 4"));
-        assertTrue(metrics.contains("druid_sql_execute_time_avg{sql=\"" + HASH + "\"} 2.5"));
-        assertTrue(metrics.contains("druid_sql_execute_time_histogram{sql=\"" + HASH
-                + "\",max=\"10000\"} 8"));
-        assertTrue(metrics.contains("druid_sql_effect_row_histogram{sql=\"" + HASH
-                + "\",max=\"99999\"} 4"));
-        assertTrue(metrics.contains("druid_sql_fetch_row_histogram{sql=\"" + HASH
-                + "\",max=\"99999\"} 9"));
-
-        String escapedUri = "/api/\\\"quoted\\\\path\\nnext";
-        assertTrue(metrics.contains("druid_uri_request_count_sum{uri=\"" + escapedUri + "\"} 4"));
-        assertTrue(metrics.contains("druid_uri_request_time_avg{uri=\"" + escapedUri + "\"} 2.5"));
-        assertFalse(metrics.contains("\nnext\""));
-    }
-
-    @Test
-    public void testEachDruidEndpointIsReadOnlyOncePerScrape() {
-        new DruidPrometheusMetricsExporter(config, statService).scrape();
-
-        assertEquals(1, statService.calls("/sql.json"));
-        assertEquals(1, statService.calls("/weburi.json"));
-        assertEquals(0, statService.calls("/basic.json"));
-        assertEquals(0, statService.calls("/datasource.json"));
-        assertEquals(0, statService.calls("/websession.json"));
-    }
-
-    @Test
-    public void testBasicAndDatasourceMetricsAreAggregatedFromDatasourceStats() {
-        config.setSql(false);
-        config.setWeburi(false);
-        config.setBasic(true);
-        config.setDatasource(true);
-        statService.add("/datasource.json", result("["
-                + "{\"ActiveCount\":2,\"PoolingCount\":3,\"MaxActive\":10,"
-                + "\"ExecuteCount\":20,\"ErrorCount\":1,\"CommitCount\":4,"
-                + "\"RollbackCount\":2,\"WaitThreadCount\":1,\"NotEmptyWaitCount\":5},"
-                + "{\"ActiveCount\":1,\"PoolingCount\":4,\"MaxActive\":20,"
-                + "\"ExecuteCount\":30,\"ErrorCount\":2,\"CommitCount\":6,"
-                + "\"RollbackCount\":3,\"WaitThreadCount\":2,\"NotEmptyWaitCount\":7}"
-                + "]"));
-
-        String metrics = new DruidPrometheusMetricsExporter(config, statService).scrape();
-
-        assertTrue(metrics.contains("druid_active_connections 3"));
-        assertTrue(metrics.contains("druid_pooling_connections 7"));
-        assertTrue(metrics.contains("druid_pooling_max_connections 30"));
-        assertTrue(metrics.contains("druid_execute_count 50"));
-        assertTrue(metrics.contains("druid_datasource_count 2"));
-        assertTrue(metrics.contains("druid_datasource_active_connections 3"));
-        assertEquals(1, statService.calls("/datasource.json"));
-        assertEquals(0, statService.calls("/basic.json"));
-    }
-
-    @Test
-    public void testZeroCountsAndShortHistogramsProduceValidNumbers() {
-        statService.add("/weburi.json", result("[{"
-                + "\"URI\":\"/empty\","
-                + "\"RequestCount\":0,"
-                + "\"RequestTimeMillis\":10,"
-                + "\"Histogram\":[3]"
-                + "}]"));
-        statService.add("/sql.json", result("[{"
-                + "\"SQL\":\"SELECT 1\","
-                + "\"ExecuteCount\":0,"
-                + "\"ExecuteAndResultSetHoldTime\":10,"
-                + "\"ExecuteAndResultHoldTimeHistogram\":[]"
-                + "}]"));
-
-        String metrics = new DruidPrometheusMetricsExporter(config, statService).scrape();
-
-        assertTrue(metrics.contains("druid_uri_request_time_avg{uri=\"/empty\"} 0"));
-        assertTrue(metrics.contains("druid_uri_request_time_histogram{uri=\"/empty\",max=\"0.01\"} 0"));
-        assertTrue(metrics.contains("druid_sql_execute_time_avg{sql=\"b1698e52a0f16203489454196a0c6307\"} 0"));
-        assertFalse(metrics.contains("NaN"));
-        assertFalse(metrics.contains("Infinity"));
-    }
-
-    @Test
-    public void testMalformedOrFailedDruidResponsesDoNotBreakScrape() {
-        statService.add("/weburi.json", "not-json");
-        statService.add("/sql.json", "{\"ResultCode\":-1,\"Content\":[{\"SQL\":\"SELECT secret\"}]}");
-
-        String metrics = new DruidPrometheusMetricsExporter(config, statService).scrape();
-
-        assertEquals(19, count(metrics, "# TYPE druid_"));
-        assertFalse(metrics.contains("secret"));
-    }
-
-    @Test
-    public void testServletReturnsPrometheusContentTypeAndBody() throws Exception {
-        DruidPrometheusMetricsServlet servlet =
-                new DruidPrometheusMetricsServlet(new DruidPrometheusMetricsExporter(config, statService));
-        MockHttpServletResponse response = new MockHttpServletResponse();
-
-        servlet.doGet(new MockHttpServletRequest(), response);
-
-        assertEquals(200, response.getStatus());
-        assertEquals("text/plain; version=0.0.4; charset=utf-8", response.getContentType());
-        assertTrue(response.getContentAsString().contains("druid_sql_execute_count_sum"));
-    }
-
     private static String result(String content) {
         return "{\"ResultCode\":1,\"Content\":" + content + "}";
     }
 
-    private static int count(String value, String token) {
-        int result = 0;
-        int offset = 0;
-        while ((offset = value.indexOf(token, offset)) >= 0) {
-            result++;
-            offset += token.length();
+    private static final class AtomicNumber {
+        private volatile double value;
+
+        private AtomicNumber(double value) {
+            this.value = value;
         }
-        return result;
     }
 
     private static final class StubStatService implements DruidPrometheusMetricsExporter.StatService {

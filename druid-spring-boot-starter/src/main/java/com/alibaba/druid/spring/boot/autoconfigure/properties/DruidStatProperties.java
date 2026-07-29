@@ -137,10 +137,6 @@ public class DruidStatProperties {
          */
         private boolean enabled = false;
         /**
-         * URL mapping of the Prometheus scrape endpoint.
-         */
-        private String urlPattern = "/actuator/prometheus";
-        /**
          * Enable basic connection pool metrics.
          */
         private boolean basic = true;
@@ -167,14 +163,6 @@ public class DruidStatProperties {
 
         public void setEnabled(boolean enabled) {
             this.enabled = enabled;
-        }
-
-        public String getUrlPattern() {
-            return urlPattern;
-        }
-
-        public void setUrlPattern(String urlPattern) {
-            this.urlPattern = urlPattern;
         }
 
         public boolean isBasic() {

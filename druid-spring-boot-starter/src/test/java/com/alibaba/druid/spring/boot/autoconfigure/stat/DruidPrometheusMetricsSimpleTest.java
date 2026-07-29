@@ -16,13 +16,15 @@
 package com.alibaba.druid.spring.boot.autoconfigure.stat;
 
 import com.alibaba.druid.spring.boot.autoconfigure.properties.DruidStatProperties;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.Test;
-import org.springframework.boot.web.servlet.ServletRegistrationBean;
-
-import java.util.Collection;
+import org.springframework.beans.BeansException;
+import org.springframework.beans.factory.ObjectProvider;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 public class DruidPrometheusMetricsSimpleTest {
@@ -48,39 +50,78 @@ public class DruidPrometheusMetricsSimpleTest {
     }
 
     @Test
-    public void testUrlPatternNormalization() {
-        assertEquals("/actuator/prometheus",
-                DruidPrometheusMetricsConfiguration.normalizeUrlPattern(null));
-        assertEquals("/actuator/prometheus",
-                DruidPrometheusMetricsConfiguration.normalizeUrlPattern("  "));
-        assertEquals("/metrics",
-                DruidPrometheusMetricsConfiguration.normalizeUrlPattern("metrics"));
-        assertEquals("/custom/metrics",
-                DruidPrometheusMetricsConfiguration.normalizeUrlPattern(" /custom/metrics "));
+    public void testConfigurationUsesExistingRegistry() {
+        DruidStatProperties properties = new DruidStatProperties();
+        properties.getPrometheus().setBasic(false);
+        properties.getPrometheus().setDatasource(false);
+        properties.getPrometheus().setSql(false);
+        properties.getPrometheus().setWeburi(false);
+        properties.getPrometheus().setWebsession(false);
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+
+        DruidPrometheusMetricsExporter exporter = new DruidPrometheusMetricsConfiguration()
+                .druidPrometheusMetricsExporter(properties, provider(registry));
+        exporter.init();
+
+        assertSame(registry, exporterMeterRegistry(exporter));
+        exporter.destroy();
     }
 
     @Test
-    public void testServletRegistrationUsesConfiguredPath() {
+    public void testConfigurationWithoutRegistryDoesNotStart() {
         DruidStatProperties properties = new DruidStatProperties();
-        properties.getPrometheus().setUrlPattern("/custom/prometheus");
+        DruidPrometheusMetricsExporter exporter = new DruidPrometheusMetricsConfiguration()
+                .druidPrometheusMetricsExporter(properties, provider(null));
 
-        ServletRegistrationBean bean = new DruidPrometheusMetricsConfiguration()
-                .druidPrometheusServletRegistrationBean(properties);
-        Collection<String> mappings = bean.getUrlMappings();
+        exporter.init();
 
-        assertEquals("druidPrometheusMetricsServlet", bean.getServletName());
-        assertTrue(mappings.contains("/custom/prometheus"));
+        assertNull(exporterMeterRegistry(exporter));
+        exporter.destroy();
     }
 
     @Test
     public void testPrometheusPropertyDefaults() {
         DruidStatProperties.Prometheus config = new DruidStatProperties.Prometheus();
         assertFalse(config.isEnabled());
-        assertEquals("/actuator/prometheus", config.getUrlPattern());
         assertTrue(config.isBasic());
         assertTrue(config.isDatasource());
         assertTrue(config.isSql());
         assertTrue(config.isWeburi());
         assertTrue(config.isWebsession());
+    }
+
+    private static Object exporterMeterRegistry(DruidPrometheusMetricsExporter exporter) {
+        try {
+            java.lang.reflect.Field field =
+                    DruidPrometheusMetricsExporter.class.getDeclaredField("meterRegistry");
+            field.setAccessible(true);
+            return field.get(exporter);
+        } catch (Exception e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private static <T> ObjectProvider<T> provider(final T value) {
+        return new ObjectProvider<T>() {
+            @Override
+            public T getObject(Object... args) throws BeansException {
+                return value;
+            }
+
+            @Override
+            public T getIfAvailable() throws BeansException {
+                return value;
+            }
+
+            @Override
+            public T getIfUnique() throws BeansException {
+                return value;
+            }
+
+            @Override
+            public T getObject() throws BeansException {
+                return value;
+            }
+        };
     }
 }
