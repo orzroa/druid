@@ -59,7 +59,7 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
 
     {
         this.dbType = JdbcConstants.MYSQL;
-        this.shardingSupport = true;
+        this.shardingSupport = false;
     }
 
     public MySqlOutputVisitor(Appendable appender) {
