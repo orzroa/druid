@@ -159,17 +159,6 @@ public final class DruidPrometheusMetricsExporter {
     }
 
     synchronized void refresh() {
-        if (config.isBasic() || config.isDatasource()) {
-            List<?> dataSources = readList("/datasource.json");
-            if (dataSources != null) {
-                if (config.isBasic()) {
-                    updateBasicMetrics(dataSources);
-                }
-                if (config.isDatasource()) {
-                    updateDataSourceMetrics(dataSources);
-                }
-            }
-        }
         if (config.isWeburi()) {
             List<?> webUris = readList("/weburi.json");
             if (webUris != null) {
@@ -182,47 +171,6 @@ public final class DruidPrometheusMetricsExporter {
                 updateSqlMetrics(sqlStats);
             }
         }
-        if (config.isWebsession()) {
-            List<?> sessions = readList("/websession.json");
-            if (sessions != null) {
-                update("websession|active", "druid_websession_active_count",
-                        "Number of active web sessions", Tags.empty(), sessions.size());
-                update("websession|count", "druid_websession_session_count",
-                        "Number of web sessions", Tags.empty(), sessions.size());
-            }
-        }
-    }
-
-    private void updateBasicMetrics(List<?> dataSources) {
-        update("basic|active", "druid_active_connections", "Number of active connections",
-                Tags.empty(), sum(dataSources, "ActiveCount"));
-        update("basic|pooling", "druid_pooling_connections", "Number of pooled connections",
-                Tags.empty(), sum(dataSources, "PoolingCount"));
-        update("basic|max", "druid_pooling_max_connections", "Maximum pooled connections",
-                Tags.empty(), sum(dataSources, "MaxActive"));
-        update("basic|execute", "druid_execute_count", "Total SQL executions",
-                Tags.empty(), sum(dataSources, "ExecuteCount"));
-        update("basic|error", "druid_error_count", "Total SQL execution errors",
-                Tags.empty(), sum(dataSources, "ErrorCount"));
-        update("basic|commit", "druid_commit_count", "Total transaction commits",
-                Tags.empty(), sum(dataSources, "CommitCount"));
-        update("basic|rollback", "druid_rollback_count", "Total transaction rollbacks",
-                Tags.empty(), sum(dataSources, "RollbackCount"));
-        update("basic|wait", "druid_wait_thread_count", "Threads waiting for a connection",
-                Tags.empty(), sum(dataSources, "WaitThreadCount"));
-        update("basic|notEmptyWait", "druid_not_empty_wait_count", "Non-empty connection waits",
-                Tags.empty(), sum(dataSources, "NotEmptyWaitCount"));
-    }
-
-    private void updateDataSourceMetrics(List<?> dataSources) {
-        update("datasource|count", "druid_datasource_count", "Number of Druid data sources",
-                Tags.empty(), dataSources.size());
-        update("datasource|active", "druid_datasource_active_connections",
-                "Active connections across all data sources",
-                Tags.empty(), sum(dataSources, "ActiveCount"));
-        update("datasource|pooling", "druid_datasource_pooling_connections",
-                "Pooled connections across all data sources",
-                Tags.empty(), sum(dataSources, "PoolingCount"));
     }
 
     @SuppressWarnings("unchecked")
@@ -383,17 +331,6 @@ public final class DruidPrometheusMetricsExporter {
         } catch (RuntimeException e) {
             return null;
         }
-    }
-
-    @SuppressWarnings("unchecked")
-    private static Number sum(List<?> values, String key) {
-        long total = 0;
-        for (Object value : values) {
-            if (value instanceof Map) {
-                total += number((Map<String, Object>) value, key).longValue();
-            }
-        }
-        return Long.valueOf(total);
     }
 
     private static Number number(Map<String, Object> values, String key) {

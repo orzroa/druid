@@ -137,14 +137,6 @@ public class DruidStatProperties {
          */
         private boolean enabled = false;
         /**
-         * Enable basic connection pool metrics.
-         */
-        private boolean basic = true;
-        /**
-         * Enable datasource metrics.
-         */
-        private boolean datasource = true;
-        /**
          * Enable SQL metrics.
          */
         private boolean sql = true;
@@ -152,10 +144,6 @@ public class DruidStatProperties {
          * Enable web URI metrics.
          */
         private boolean weburi = true;
-        /**
-         * Enable web session metrics.
-         */
-        private boolean websession = true;
 
         public boolean isEnabled() {
             return enabled;
@@ -163,22 +151,6 @@ public class DruidStatProperties {
 
         public void setEnabled(boolean enabled) {
             this.enabled = enabled;
-        }
-
-        public boolean isBasic() {
-            return basic;
-        }
-
-        public void setBasic(boolean basic) {
-            this.basic = basic;
-        }
-
-        public boolean isDatasource() {
-            return datasource;
-        }
-
-        public void setDatasource(boolean datasource) {
-            this.datasource = datasource;
         }
 
         public boolean isSql() {
@@ -197,13 +169,6 @@ public class DruidStatProperties {
             this.weburi = weburi;
         }
 
-        public boolean isWebsession() {
-            return websession;
-        }
-
-        public void setWebsession(boolean websession) {
-            this.websession = websession;
-        }
     }
 
     public static class WebStatFilter {

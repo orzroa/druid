@@ -52,11 +52,8 @@ public class DruidPrometheusMetricsSimpleTest {
     @Test
     public void testConfigurationUsesExistingRegistry() {
         DruidStatProperties properties = new DruidStatProperties();
-        properties.getPrometheus().setBasic(false);
-        properties.getPrometheus().setDatasource(false);
         properties.getPrometheus().setSql(false);
         properties.getPrometheus().setWeburi(false);
-        properties.getPrometheus().setWebsession(false);
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
 
         DruidPrometheusMetricsExporter exporter = new DruidPrometheusMetricsConfiguration()
@@ -83,11 +80,8 @@ public class DruidPrometheusMetricsSimpleTest {
     public void testPrometheusPropertyDefaults() {
         DruidStatProperties.Prometheus config = new DruidStatProperties.Prometheus();
         assertFalse(config.isEnabled());
-        assertTrue(config.isBasic());
-        assertTrue(config.isDatasource());
         assertTrue(config.isSql());
         assertTrue(config.isWeburi());
-        assertTrue(config.isWebsession());
     }
 
     private static Object exporterMeterRegistry(DruidPrometheusMetricsExporter exporter) {

@@ -44,9 +44,6 @@ public class DruidPrometheusMetricsTest {
     @Before
     public void setUp() {
         config = new DruidStatProperties.Prometheus();
-        config.setBasic(false);
-        config.setDatasource(false);
-        config.setWebsession(false);
         config.setSql(true);
         config.setWeburi(true);
         registry = new SimpleMeterRegistry();
@@ -108,32 +105,6 @@ public class DruidPrometheusMetricsTest {
         assertEquals(1, statService.calls("/weburi.json"));
         assertEquals(0, statService.calls("/datasource.json"));
         assertEquals(0, statService.calls("/websession.json"));
-    }
-
-    @Test
-    public void testBasicAndDatasourceMetricsAreAggregated() {
-        config.setSql(false);
-        config.setWeburi(false);
-        config.setBasic(true);
-        config.setDatasource(true);
-        statService.add("/datasource.json", result("["
-                + "{\"ActiveCount\":2,\"PoolingCount\":3,\"MaxActive\":10,"
-                + "\"ExecuteCount\":20,\"ErrorCount\":1,\"CommitCount\":4,"
-                + "\"RollbackCount\":2,\"WaitThreadCount\":1,\"NotEmptyWaitCount\":5},"
-                + "{\"ActiveCount\":1,\"PoolingCount\":4,\"MaxActive\":20,"
-                + "\"ExecuteCount\":30,\"ErrorCount\":2,\"CommitCount\":6,"
-                + "\"RollbackCount\":3,\"WaitThreadCount\":2,\"NotEmptyWaitCount\":7}"
-                + "]"));
-
-        exporter().refresh();
-
-        assertGauge(3, "druid_active_connections");
-        assertGauge(7, "druid_pooling_connections");
-        assertGauge(30, "druid_pooling_max_connections");
-        assertGauge(50, "druid_execute_count");
-        assertGauge(2, "druid_datasource_count");
-        assertGauge(3, "druid_datasource_active_connections");
-        assertEquals(1, statService.calls("/datasource.json"));
     }
 
     @Test

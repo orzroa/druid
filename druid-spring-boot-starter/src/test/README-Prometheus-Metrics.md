@@ -32,19 +32,16 @@ management.endpoints.web.exposure.include=prometheus
 Metric groups can be configured independently:
 
 ```properties
-spring.datasource.druid.prometheus.basic=true
-spring.datasource.druid.prometheus.datasource=true
 spring.datasource.druid.prometheus.sql=true
 spring.datasource.druid.prometheus.weburi=true
-spring.datasource.druid.prometheus.websession=true
 ```
 
 Druid metric registration is disabled by default. All metric groups default to
 enabled after registration itself is enabled. If the application has no
 Micrometer `MeterRegistry`, no Druid metrics or refresh task are started.
 
-SQL metrics require Druid's stat filter. URI and session metrics require the
-web stat filter:
+SQL metrics require Druid's stat filter. URI metrics require the web stat
+filter:
 
 ```properties
 spring.datasource.druid.filter.stat.enabled=true
@@ -90,23 +87,6 @@ counters.
 
 The `sql` label is the lowercase MD5 of the UTF-8 SQL text. The original SQL
 remains available from Druid's SQL statistics page and `/druid/sql.json`.
-
-The exporter also provides optional basic, datasource, and web-session gauges:
-
-- `druid_active_connections`
-- `druid_pooling_connections`
-- `druid_pooling_max_connections`
-- `druid_execute_count`
-- `druid_error_count`
-- `druid_commit_count`
-- `druid_rollback_count`
-- `druid_wait_thread_count`
-- `druid_not_empty_wait_count`
-- `druid_datasource_count`
-- `druid_datasource_active_connections`
-- `druid_datasource_pooling_connections`
-- `druid_websession_active_count`
-- `druid_websession_session_count`
 
 ## Prometheus configuration
 
