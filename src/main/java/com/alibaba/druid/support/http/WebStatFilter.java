@@ -170,6 +170,13 @@ public class WebStatFilter extends AbstractWebStatImpl implements Filter {
                 uriStat.afterInvoke(error, nanos);
             }
 
+            if (!httpRequest.isAsyncStarted() && WebStatEventContext.hasListeners()) {
+                String eventUri = uriStat == null ? requestURI : uriStat.getUri();
+                WebStatEventContext.fireWebRequest(httpRequest, eventUri, nanos,
+                        requestStat.getJdbcExecuteCount(), requestStat.getJdbcUpdateCount(),
+                        requestStat.getJdbcFetchRowCount(), error);
+            }
+
             WebRequestStat.set(null);
 
             if (isProfileEnable()) {

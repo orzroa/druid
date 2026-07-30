@@ -306,6 +306,10 @@ spring.datasource.druid.prometheus.uri-template.include-context-path=false
 URI 模板固定采用“应用 SPI → Spring MVC 模板 → 原始 URI”的优先级。
 Histogram 不提供配置项，按 D8 永久关闭。
 
+运行时需要替换配置时，应用可取得 starter 暴露的
+`DruidPrometheusMetricsRefresher` 并调用 `refresh(Prometheus)`；替换对事件路径
+原子生效，不删除或重建已有 Meter，`max-window` 仅作用于之后新建的 Meter。
+
 ## 10. 测试与验收
 
 - 单元测试：SQL/URI 到新 Meter 的值、单位、标签和窗口 max；确认不注册 bucket。

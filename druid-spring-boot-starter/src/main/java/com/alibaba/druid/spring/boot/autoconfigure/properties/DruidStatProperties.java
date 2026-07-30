@@ -135,15 +135,10 @@ public class DruidStatProperties {
         /**
          * Enable Prometheus metrics export.
          */
-        private boolean enabled = false;
-        /**
-         * Enable SQL metrics.
-         */
-        private boolean sql = true;
-        /**
-         * Enable web URI metrics.
-         */
-        private boolean weburi = true;
+        private boolean enabled = true;
+        private Events events = new Events();
+        private SqlMapping sqlMapping = new SqlMapping();
+        private UriTemplate uriTemplate = new UriTemplate();
 
         public boolean isEnabled() {
             return enabled;
@@ -153,20 +148,69 @@ public class DruidStatProperties {
             this.enabled = enabled;
         }
 
-        public boolean isSql() {
-            return sql;
+        public Events getEvents() {
+            return events;
         }
 
-        public void setSql(boolean sql) {
-            this.sql = sql;
+        public void setEvents(Events events) {
+            this.events = events;
         }
 
-        public boolean isWeburi() {
-            return weburi;
+        public SqlMapping getSqlMapping() {
+            return sqlMapping;
         }
 
-        public void setWeburi(boolean weburi) {
-            this.weburi = weburi;
+        public void setSqlMapping(SqlMapping sqlMapping) {
+            this.sqlMapping = sqlMapping;
+        }
+
+        public UriTemplate getUriTemplate() {
+            return uriTemplate;
+        }
+
+        public void setUriTemplate(UriTemplate uriTemplate) {
+            this.uriTemplate = uriTemplate;
+        }
+
+        public static class SqlMapping {
+            private boolean enabled = true;
+            private String directory = "./logs/druid/sql-mapping";
+            private int queueSize = 1000;
+
+            public boolean isEnabled() { return enabled; }
+            public void setEnabled(boolean enabled) { this.enabled = enabled; }
+            public String getDirectory() { return directory; }
+            public void setDirectory(String directory) { this.directory = directory; }
+            public int getQueueSize() { return queueSize; }
+            public void setQueueSize(int queueSize) { this.queueSize = queueSize; }
+        }
+
+        public static class Events {
+            private boolean enabled = true;
+            private int maxSqlIdentities = 1000;
+            private int maxUriIdentities = 1000;
+            private String maxWindow = "2m";
+            private long logStep = 1000;
+
+            public boolean isEnabled() { return enabled; }
+            public void setEnabled(boolean enabled) { this.enabled = enabled; }
+            public int getMaxSqlIdentities() { return maxSqlIdentities; }
+            public void setMaxSqlIdentities(int maxSqlIdentities) { this.maxSqlIdentities = maxSqlIdentities; }
+            public int getMaxUriIdentities() { return maxUriIdentities; }
+            public void setMaxUriIdentities(int maxUriIdentities) { this.maxUriIdentities = maxUriIdentities; }
+            public String getMaxWindow() { return maxWindow; }
+            public void setMaxWindow(String maxWindow) { this.maxWindow = maxWindow; }
+            public long getLogStep() { return logStep; }
+            public void setLogStep(long logStep) { this.logStep = logStep; }
+        }
+
+        public static class UriTemplate {
+            private boolean includeContextPath = false;
+
+            public boolean isIncludeContextPath() { return includeContextPath; }
+            public void setIncludeContextPath(boolean includeContextPath) {
+                this.includeContextPath = includeContextPath;
+            }
         }
 
     }

@@ -18,9 +18,12 @@ package com.alibaba.druid.filter.stat;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
+import com.alibaba.druid.proxy.jdbc.DataSourceProxy;
+
 public class StatFilterContext {
 
     private List<StatFilterContextListener> listeners = new CopyOnWriteArrayList<StatFilterContextListener>();
+    private List<StatFilterEventListener> eventListeners = new CopyOnWriteArrayList<StatFilterEventListener>();
 
     private static final StatFilterContext  instance  = new StatFilterContext();
 
@@ -38,6 +41,50 @@ public class StatFilterContext {
 
     public List<StatFilterContextListener> getListeners() {
         return listeners;
+    }
+
+    public void addEventListener(StatFilterEventListener listener) {
+        if (listener != null) {
+            eventListeners.add(listener);
+        }
+    }
+
+    public boolean removeEventListener(StatFilterEventListener listener) {
+        return eventListeners.remove(listener);
+    }
+
+    public boolean hasEventListeners() {
+        return !eventListeners.isEmpty();
+    }
+
+    public void sqlExecute(String sql, DataSourceProxy dataSource, long durationNanos, Throwable error) {
+        for (StatFilterEventListener listener : eventListeners) {
+            try {
+                listener.onSqlExecute(sql, dataSource, durationNanos, error);
+            } catch (Throwable ignored) {
+                // Metrics listeners must not affect JDBC execution.
+            }
+        }
+    }
+
+    public void sqlUpdateCount(String sql, DataSourceProxy dataSource, int updateCount) {
+        for (StatFilterEventListener listener : eventListeners) {
+            try {
+                listener.onSqlUpdateCount(sql, dataSource, updateCount);
+            } catch (Throwable ignored) {
+                // Metrics listeners must not affect JDBC execution.
+            }
+        }
+    }
+
+    public void sqlResultSetClose(String sql, DataSourceProxy dataSource, int fetchRowCount) {
+        for (StatFilterEventListener listener : eventListeners) {
+            try {
+                listener.onSqlResultSetClose(sql, dataSource, fetchRowCount);
+            } catch (Throwable ignored) {
+                // Metrics listeners must not affect JDBC execution.
+            }
+        }
     }
 
     public void addUpdateCount(int updateCount) {
