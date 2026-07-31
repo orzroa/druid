@@ -28,10 +28,15 @@ import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.BeansException;
+import org.springframework.beans.factory.BeanFactory;
+import org.springframework.beans.factory.BeanFactoryAware;
+import org.springframework.beans.factory.ListableBeanFactory;
 import org.springframework.beans.factory.ObjectProvider;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
+import javax.sql.DataSource;
 import javax.servlet.http.HttpServletRequest;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -42,6 +47,7 @@ import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
+import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -54,7 +60,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * Records native Druid statistic events in the application's MeterRegistry.
  */
 public final class DruidPrometheusMetricsListener implements StatFilterEventListener, WebStatEventListener,
-        DruidPrometheusMetricsRefresher {
+        DruidPrometheusMetricsRefresher, BeanFactoryAware {
     private static final Logger LOG = LoggerFactory.getLogger(DruidPrometheusMetricsListener.class);
     private static final String SPRING_MVC_PATTERN_ATTRIBUTE =
             "org.springframework.web.servlet.HandlerMapping.bestMatchingPattern";
@@ -64,6 +70,8 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     private final ObjectProvider<DruidUriTemplateResolver> uriTemplateResolverProvider;
     private final ConcurrentMap<String, SqlState> sqlStates = new ConcurrentHashMap<String, SqlState>();
     private final ConcurrentMap<String, UriMeters> uriMeters = new ConcurrentHashMap<String, UriMeters>();
+    private final ConcurrentMap<DataSourceProxy, String> dataSourceBeanNames =
+            new ConcurrentHashMap<DataSourceProxy, String>();
     private final AtomicInteger sqlIdentityCount = new AtomicInteger();
     private final AtomicInteger uriIdentityCount = new AtomicInteger();
     private final AtomicLong sqlDropped = new AtomicLong();
@@ -73,6 +81,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     private volatile ThreadPoolExecutor mappingExecutor;
     private volatile Counter sqlDroppedCounter;
     private volatile Counter uriDroppedCounter;
+    private volatile ListableBeanFactory beanFactory;
 
     public DruidPrometheusMetricsListener(DruidStatProperties.Prometheus config,
                                            ObjectProvider<MeterRegistry> meterRegistryProvider,
@@ -114,6 +123,13 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     public void refresh(DruidStatProperties.Prometheus config) {
         if (config != null) {
             this.config = config;
+        }
+    }
+
+    @Override
+    public void setBeanFactory(BeanFactory beanFactory) throws BeansException {
+        if (beanFactory instanceof ListableBeanFactory) {
+            this.beanFactory = (ListableBeanFactory) beanFactory;
         }
     }
 
@@ -331,10 +347,31 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     }
 
     private String dataSourceName(DataSourceProxy dataSource) {
-        if (dataSource == null || dataSource.getName() == null || dataSource.getName().length() == 0) {
+        if (dataSource == null) {
             return "unknown";
         }
-        return dataSource.getName();
+        if (dataSource.getName() != null && dataSource.getName().length() != 0) {
+            return dataSource.getName();
+        }
+        String beanName = dataSourceBeanNames.get(dataSource);
+        if (beanName != null) {
+            return beanName;
+        }
+        ListableBeanFactory factory = beanFactory;
+        if (factory != null) {
+            try {
+                Map<String, DataSource> dataSources = factory.getBeansOfType(DataSource.class, false, false);
+                for (Map.Entry<String, DataSource> entry : dataSources.entrySet()) {
+                    if (entry.getValue() == dataSource) {
+                        dataSourceBeanNames.putIfAbsent(dataSource, entry.getKey());
+                        return entry.getKey();
+                    }
+                }
+            } catch (BeansException ignored) {
+                // The fallback must not affect the JDBC event path.
+            }
+        }
+        return "unknown";
     }
 
     private Duration maxWindow() {

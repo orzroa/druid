@@ -63,7 +63,7 @@ public class DruidStatProperties {
         /**
          * Enable StatViewServlet.
          */
-        private boolean enabled = true;
+        private boolean enabled = false;
         private String urlPattern;
         private String allow;
         private String deny;

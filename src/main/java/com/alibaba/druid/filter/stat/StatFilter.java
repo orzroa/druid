@@ -458,7 +458,9 @@ public class StatFilter extends FilterEventAdapter implements StatFilterMBean {
                 try {
                     int updateCount = statement.getUpdateCount();
                     sqlStat.addUpdateCount(updateCount);
-                    StatFilterContext.getInstance().sqlUpdateCount(sqlStat.getSql(), directDataSource, updateCount);
+                    if (StatFilterContext.getInstance().hasEventListeners()) {
+                        StatFilterContext.getInstance().sqlUpdateCount(sqlStat.getSql(), directDataSource, updateCount);
+                    }
                 } catch (SQLException e) {
                     LOG.error("getUpdateCount error", e);
                 }
@@ -467,7 +469,9 @@ public class StatFilter extends FilterEventAdapter implements StatFilterMBean {
                     sqlStat.addUpdateCount(updateCount);
                     sqlStat.addFetchRowCount(0);
                     StatFilterContext.getInstance().addUpdateCount(updateCount);
-                    StatFilterContext.getInstance().sqlUpdateCount(sqlStat.getSql(), directDataSource, updateCount);
+                    if (StatFilterContext.getInstance().hasEventListeners()) {
+                        StatFilterContext.getInstance().sqlUpdateCount(sqlStat.getSql(), directDataSource, updateCount);
+                    }
                 }
             }
 
@@ -488,7 +492,9 @@ public class StatFilter extends FilterEventAdapter implements StatFilterMBean {
         String sql = statement.getLastExecuteSql();
         StatFilterContext.getInstance().executeAfter(sql, nanos, null);
         if (sqlStat != null) {
-            StatFilterContext.getInstance().sqlExecute(sqlStat.getSql(), directDataSource, nanos, null);
+            if (StatFilterContext.getInstance().hasEventListeners()) {
+                StatFilterContext.getInstance().sqlExecute(sqlStat.getSql(), directDataSource, nanos, null);
+            }
         }
 
         Profiler.release(nanos);
@@ -520,8 +526,10 @@ public class StatFilter extends FilterEventAdapter implements StatFilterMBean {
             sqlStat.error(error);
             sqlStat.addExecuteTime(statement.getLastExecuteType(), statement.isFirstResultSet(), nanos);
             statement.setLastExecuteTimeNano(nanos);
-            StatFilterContext.getInstance().sqlExecute(sqlStat.getSql(),
-                    statement.getConnectionProxy().getDirectDataSource(), nanos, error);
+            if (StatFilterContext.getInstance().hasEventListeners()) {
+                StatFilterContext.getInstance().sqlExecute(sqlStat.getSql(),
+                        statement.getConnectionProxy().getDirectDataSource(), nanos, error);
+            }
         }
 
         StatFilterContext.getInstance().executeAfter(sql, nanos, error);
@@ -603,7 +611,9 @@ public class StatFilter extends FilterEventAdapter implements StatFilterMBean {
             JdbcSqlStat sqlStat = resultSet.getSqlStat();
             if (sqlStat != null && resultSet.getCloseCount() == 0) {
                 sqlStat.addFetchRowCount(fetchRowCount);
-                StatFilterContext.getInstance().sqlResultSetClose(sqlStat.getSql(), chain.getDataSource(), fetchRowCount);
+                if (StatFilterContext.getInstance().hasEventListeners()) {
+                    StatFilterContext.getInstance().sqlResultSetClose(sqlStat.getSql(), chain.getDataSource(), fetchRowCount);
+                }
                 long stmtExecuteNano = resultSet.getStatementProxy().getLastExecuteTimeNano();
                 sqlStat.addResultSetHoldTimeNano(stmtExecuteNano, nanos);
                 if (resultSet.getReadStringLength() > 0) {

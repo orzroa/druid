@@ -278,8 +278,9 @@ API，但会面临 Filter 顺序、异常路径、异步请求和与 Druid StatF
 
 ## 9. 配置草案
 
-配置名尚未定稿，拟提供以下配置；均有默认值。默认在启动时加载，接入刷新 SPI 后
-支持运行时替换配置快照：
+配置名尚未定稿，拟提供以下配置；均有默认值。Prometheus 注册默认关闭，需显式将
+`spring.datasource.druid.prometheus.enabled` 设为 `true`；其余配置在启用后使用以下
+默认值。默认在启动时加载，接入刷新 SPI 后支持运行时替换配置快照：
 
 ```properties
 spring.datasource.druid.prometheus.enabled=true
@@ -309,6 +310,9 @@ Histogram 不提供配置项，按 D8 永久关闭。
 运行时需要替换配置时，应用可取得 starter 暴露的
 `DruidPrometheusMetricsRefresher` 并调用 `refresh(Prometheus)`；替换对事件路径
 原子生效，不删除或重建已有 Meter，`max-window` 仅作用于之后新建的 Meter。
+`enabled`、`events.enabled`、两个 identity 上限、`log-step`、SQL 映射开关与目录、
+以及 URI context-path 开关，对后续事件立即生效；`max-window` 仅对新建 Meter
+生效；`sql-mapping.queue-size` 仅在映射写线程创建时读取，修改后需重启才能生效。
 
 ## 10. 测试与验收
 
