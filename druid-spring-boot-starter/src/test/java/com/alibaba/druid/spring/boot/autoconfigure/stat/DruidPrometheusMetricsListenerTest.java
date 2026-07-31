@@ -17,10 +17,14 @@ package com.alibaba.druid.spring.boot.autoconfigure.stat;
 
 import com.alibaba.druid.pool.DruidDataSource;
 import com.alibaba.druid.spring.boot.autoconfigure.properties.DruidStatProperties;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.Test;
 import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
 
 import javax.servlet.http.HttpServletRequest;
 import java.lang.reflect.Proxy;
@@ -30,6 +34,7 @@ import java.nio.file.Path;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 
 public class DruidPrometheusMetricsListenerTest {
     @Test
@@ -165,5 +170,36 @@ public class DruidPrometheusMetricsListenerTest {
             @Override public T getIfUnique() throws BeansException { return value; }
             @Override public T getObject() throws BeansException { return value; }
         };
+    }
+
+    /**
+     * 零配置开箱即用：未在 Environment 中设置
+     * spring.datasource.druid.prometheus.enabled 时，配置类仍应注册 Listener Bean
+     * （matchIfMissing=true 修复前，此用例会失败）。
+     */
+    @Test
+    public void configRegistersListenerWhenEnabledPropertyMissing() {
+        AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext();
+        context.register(ConfigWithMeterRegistry.class, DruidPrometheusMetricsConfiguration.class);
+        context.refresh();
+        try {
+            assertTrue("未配置 enabled 时也应注册 DruidPrometheusMetricsListener",
+                    context.containsBean("druidPrometheusMetricsListener"));
+        } finally {
+            context.close();
+        }
+    }
+
+    @Configuration
+    static class ConfigWithMeterRegistry {
+        @Bean
+        public MeterRegistry meterRegistry() {
+            return new SimpleMeterRegistry();
+        }
+
+        @Bean
+        public DruidStatProperties druidStatProperties() {
+            return new DruidStatProperties();
+        }
     }
 }

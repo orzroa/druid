@@ -29,7 +29,7 @@ import org.springframework.context.annotation.Bean;
  * @author druid
  */
 @ConditionalOnClass(MeterRegistry.class)
-@ConditionalOnProperty(name = "spring.datasource.druid.prometheus.enabled", havingValue = "true")
+@ConditionalOnProperty(name = "spring.datasource.druid.prometheus.enabled", havingValue = "true", matchIfMissing = true)
 public class DruidPrometheusMetricsConfiguration {
     @Bean
     @ConditionalOnMissingBean
