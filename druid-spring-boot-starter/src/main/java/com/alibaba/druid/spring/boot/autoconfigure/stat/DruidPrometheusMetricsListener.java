@@ -428,7 +428,8 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             return;
         }
         Path directory = Paths.get(config.getSqlMapping().getDirectory());
-        Path target = directory.resolve(hash);
+        // 落盘文件名带上 .sql 后缀，便于人工识别与编辑器语法高亮
+        Path target = directory.resolve(hash + ".sql");
         try {
             if (Files.exists(target)) {
                 return;
@@ -438,7 +439,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
                 return;
             }
             // 先写临时文件再原子重命名，保证目标文件要么完整存在、要么不存在
-            Path temporary = Files.createTempFile(directory, hash, ".tmp");
+            Path temporary = Files.createTempFile(directory, hash, ".sql.tmp");
             try {
                 Files.write(temporary, sql.getBytes(StandardCharsets.UTF_8));
                 try {

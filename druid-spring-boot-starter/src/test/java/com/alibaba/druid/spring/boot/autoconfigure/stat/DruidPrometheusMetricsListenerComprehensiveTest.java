@@ -282,7 +282,7 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
 
             listener.onSqlExecute(sql, dataSource("primary"), 1L, null);
 
-            Path file = dir.resolve(hash(sql));
+            Path file = dir.resolve(hash(sql) + ".sql");
             awaitFile(file); // Meter 同步创建，但文件落盘异步
             assertEquals(sql, new String(Files.readAllBytes(file), StandardCharsets.UTF_8));
         } finally {
@@ -296,7 +296,7 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
         try {
             String sql = "select 3";
             String hash = hash(sql);
-            Files.write(dir.resolve(hash), "ORIGINAL".getBytes(StandardCharsets.UTF_8));
+            Files.write(dir.resolve(hash + ".sql"), "ORIGINAL".getBytes(StandardCharsets.UTF_8));
 
             SimpleMeterRegistry registry = new SimpleMeterRegistry();
             DruidStatProperties.Prometheus config = defaultConfig(true);
@@ -308,7 +308,7 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
             awaitSqlMeter(registry, sql, "primary");
 
             assertEquals("ORIGINAL",
-                    new String(Files.readAllBytes(dir.resolve(hash)), StandardCharsets.UTF_8));
+                    new String(Files.readAllBytes(dir.resolve(hash + ".sql")), StandardCharsets.UTF_8));
         } finally {
             deleteRecursively(dir);
         }
@@ -328,7 +328,7 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
             listener.onSqlExecute(sql, dataSource("primary"), 1L, null);
             awaitSqlMeter(registry, sql, "primary");
 
-            assertFalse(Files.exists(dir.resolve(hash(sql))));
+            assertFalse(Files.exists(dir.resolve(hash(sql) + ".sql")));
         } finally {
             deleteRecursively(dir);
         }
