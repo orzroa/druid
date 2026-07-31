@@ -130,18 +130,14 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
         listener.init();
         DataSourceProxy ds = dataSource("primary");
 
-        listener.onSqlExecute("select 1", ds, 1_000_000L, null); // 触发异步建表（首条不记录）
-        awaitSqlMeter(registry, "select 1", "primary");
+        listener.onSqlExecute("select 1", ds, 1_000_000L, null);
 
         Timer timer = registry.find("druid.sql.execution.duration")
                 .tags("sql", hash("select 1"), "datasource", "primary").timer();
         assertNotNull(timer);
-        long baseCount = timer.count();
-        double baseTotal = timer.totalTime(TimeUnit.NANOSECONDS);
-        // Meter 就绪后，本次执行才会被记录
-        listener.onSqlExecute("select 1", ds, 1_000_000L, null);
-        assertEquals(baseCount + 1L, timer.count());
-        assertEquals(baseTotal + 1_000_000.0, timer.totalTime(TimeUnit.NANOSECONDS), 0.0);
+        // Meter 同步创建，首次执行即被记录
+        assertEquals(1L, timer.count());
+        assertEquals(1_000_000.0, timer.totalTime(TimeUnit.NANOSECONDS), 0.0);
     }
 
     @Test
@@ -151,19 +147,15 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
         listener.init();
         DataSourceProxy ds = dataSource("primary");
 
-        listener.onSqlExecute("select 1", ds, 100L, null); // 触发异步建表
-        awaitSqlMeter(registry, "select 1", "primary");
-
-        Timer timer = registry.find("druid.sql.execution.duration")
-                .tags("sql", hash("select 1"), "datasource", "primary").timer();
-        long baseCount = timer.count();
-        double baseTotal = timer.totalTime(TimeUnit.NANOSECONDS);
         listener.onSqlExecute("select 1", ds, 100L, null);
         listener.onSqlExecute("select 1", ds, 200L, null);
         listener.onSqlExecute("select 1", ds, 300L, null);
-        // 复用同一 Meter，三次记录都计入
-        assertEquals(baseCount + 3L, timer.count());
-        assertEquals(baseTotal + 600.0, timer.totalTime(TimeUnit.NANOSECONDS), 0.0);
+
+        Timer timer = registry.find("druid.sql.execution.duration")
+                .tags("sql", hash("select 1"), "datasource", "primary").timer();
+        // 复用同一 Meter，三次记录都计入（首次不再丢失）
+        assertEquals(3L, timer.count());
+        assertEquals(600.0, timer.totalTime(TimeUnit.NANOSECONDS), 0.0);
     }
 
     @Test
@@ -289,10 +281,9 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
             listener.init();
 
             listener.onSqlExecute(sql, dataSource("primary"), 1L, null);
-            awaitSqlMeter(registry, sql, "primary");
 
             Path file = dir.resolve(hash(sql));
-            assertTrue(Files.exists(file));
+            awaitFile(file); // Meter 同步创建，但文件落盘异步
             assertEquals(sql, new String(Files.readAllBytes(file), StandardCharsets.UTF_8));
         } finally {
             deleteRecursively(dir);
@@ -552,7 +543,7 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
     // ==================== 并发：队列满丢弃 ====================
 
     @Test
-    public void queueFull_dropsAndDoesNotBlockEventPath() throws Exception {
+    public void queueFull_doesNotLoseMetricsUnderWritePressure() throws Exception {
         Path dir = Files.createTempDirectory("druid-prom-queue-");
         try {
             SimpleMeterRegistry registry = new SimpleMeterRegistry();
@@ -564,25 +555,18 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
             listener.init();
 
             final int total = 300;
-            // 单线程顺序提交大量不同 SQL，落盘单写线程无法及时消费，队列满后丢弃
+            // 单线程顺序提交大量不同 SQL，落盘单写线程无法及时消费；
+            // 但 Meter 同步创建，队列满只会跳过文件落盘，不应丢失任何观测
             for (int i = 0; i < total; i++) {
                 listener.onSqlExecute("select " + i, dataSource("primary"), 1L, null);
             }
 
-            // 每个 SQL 最终要么建 Meter、要么被丢弃，二者之和应等于提交总数
-            awaitCondition(5_000L, () -> {
-                long created = registry.find("druid.sql.execution.duration").meters().size();
-                Counter dropped = registry.find("druid.prometheus.meter.dropped").tag("type", "sql").counter();
-                long droppedCount = dropped == null ? 0L : (long) dropped.count();
-                return created + droppedCount == total;
-            });
-
-            long created = registry.find("druid.sql.execution.duration").meters().size();
+            // 全部 SQL 都应建出 Meter，无丢弃
+            awaitCondition(5_000L, () -> registry.find("druid.sql.execution.duration").meters().size() == total);
+            assertEquals(total, registry.find("druid.sql.execution.duration").meters().size());
             Counter dropped = registry.find("druid.prometheus.meter.dropped").tag("type", "sql").counter();
-            long droppedCount = (long) dropped.count();
-            assertTrue("应当至少有一次因队列满被丢弃，created=" + created + ", dropped=" + droppedCount,
-                    droppedCount > 0L);
-            assertEquals(total, created + droppedCount);
+            long droppedCount = dropped == null ? 0L : (long) dropped.count();
+            assertEquals(0L, droppedCount);
         } finally {
             deleteRecursively(dir);
         }
@@ -629,6 +613,11 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
                 .tags("sql", hash, "datasource", dataSource).timer() != null);
         assertNotNull(registry.find("druid.sql.execution.duration")
                 .tags("sql", hash, "datasource", dataSource).timer());
+    }
+
+    private static void awaitFile(Path file) throws Exception {
+        awaitCondition(3_000L, () -> Files.exists(file));
+        assertTrue(Files.exists(file));
     }
 
     private static void awaitCondition(long timeoutMs, BooleanSupplier condition) throws Exception {

@@ -120,8 +120,13 @@ public class DruidPrometheusMetricsListenerTest {
                 provider((DruidUriTemplateResolver) null));
         listener.init();
         listener.onSqlExecute(sql, null, 1L, null);
-        awaitSqlMeter(registry, sql, "unknown");
-        assertEquals(sql, new String(Files.readAllBytes(directory.resolve(hash)), StandardCharsets.UTF_8));
+        // Meter 同步创建，但 SQL 文本映射文件异步落盘，需等待文件写入完成
+        Path mappingFile = directory.resolve(hash);
+        long deadline = System.currentTimeMillis() + 2000L;
+        while (!Files.exists(mappingFile) && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10L);
+        }
+        assertEquals(sql, new String(Files.readAllBytes(mappingFile), StandardCharsets.UTF_8));
         listener.destroy();
         Files.deleteIfExists(directory.resolve(hash));
         Files.deleteIfExists(directory);

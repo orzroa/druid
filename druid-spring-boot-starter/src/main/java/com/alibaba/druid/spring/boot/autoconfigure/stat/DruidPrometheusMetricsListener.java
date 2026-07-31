@@ -316,21 +316,30 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             sqlIdentityCount.decrementAndGet();
             return existing;
         }
-        // 首次见到该 SQL：异步提交“落盘 + 建 Meter”任务
+        // 同步创建 Meter，使首次执行即可被记录；SQL 文本映射仍异步落盘。
+        // Meter 注册只是 MeterRegistry 内部的 ConcurrentHashMap 写入（微秒级），
+        // 不会阻塞 JDBC 事件路径；真正耗时的文件落盘仍由 submitMapping 异步完成。
+        try {
+            candidate.meters = createSqlMeters(candidate.hash, candidate.dataSource);
+        } catch (RuntimeException e) {
+            sqlStates.remove(key, candidate);
+            sqlIdentityCount.decrementAndGet();
+            dropSql("SQL meter creation failed");
+            return null;
+        }
         submitMapping(candidate, key);
         return candidate;
     }
 
     /**
-     * 把“写 SQL 映射文件 + 创建 SQL Meter”的任务提交给落盘线程。
-     * 若线程不可用或队列已满，则回滚缓存并计入丢弃。
+     * 把“写 SQL 映射文件”的任务提交给落盘线程（Meter 已在 {@link #sqlState} 中同步创建）。
+     * 若线程不可用或队列已满，仅跳过落盘，不丢弃已创建的 Meter，避免丢失观测。
      */
     private void submitMapping(final SqlState state, final String key) {
         ThreadPoolExecutor executor = mappingExecutor;
         if (executor == null) {
-            sqlStates.remove(key, state);
-            sqlIdentityCount.decrementAndGet();
-            dropSql("mapping executor is unavailable");
+            // 无落盘线程：保留 Meter，仅释放 SQL 原文
+            state.sql = null;
             return;
         }
         try {
@@ -339,21 +348,17 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
                 public void run() {
                     try {
                         writeSqlMapping(state.hash, state.sql);
-                        // SQL 文本已落盘，建好 Meter 后即可释放内存中的原文
-                        state.meters = createSqlMeters(state.hash, state.dataSource);
+                    } catch (RuntimeException ignored) {
+                        // 落盘失败不影响已有 Meter，仅放弃本次映射写盘
+                    } finally {
+                        // SQL 文本已落盘（或放弃落盘），释放内存中的原文
                         state.sql = null;
-                    } catch (RuntimeException e) {
-                        sqlStates.remove(key, state);
-                        sqlIdentityCount.decrementAndGet();
-                        dropSql("SQL mapping write failed");
                     }
                 }
             });
         } catch (RuntimeException e) {
-            // 队列满触发 AbortPolicy
-            sqlStates.remove(key, state);
-            sqlIdentityCount.decrementAndGet();
-            dropSql("SQL mapping queue is full");
+            // 队列满触发 AbortPolicy：保留 Meter，仅释放 SQL 原文
+            state.sql = null;
         }
     }
 
