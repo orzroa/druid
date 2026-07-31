@@ -487,7 +487,8 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     /**
      * 取得 DataSource 的可读名称，用于 Meter 的 {@code datasource} 标签：
      * <ol>
-     *     <li>优先用 Druid 自己的 {@link DataSourceProxy#getName()}；</li>
+     *     <li>优先从 JDBC URL 中解析库名（如 {@code jdbc:mysql://host:3306/crs} -> {@code crs}）；</li>
+     *     <li>否则用 Druid 自己的 {@link DataSourceProxy#getName()}；</li>
      *     <li>否则反查 Spring 容器中该实例对应的 Bean 名（带缓存）；</li>
      *     <li>都没有则返回 {@code "unknown"}。</li>
      * </ol>
@@ -495,6 +496,11 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     private String dataSourceName(DataSourceProxy dataSource) {
         if (dataSource == null) {
             return "unknown";
+        }
+        // 优先用 JDBC URL 中的库名，比 "DataSource-<identityHashCode>" 更可读
+        String database = databaseNameFromUrl(dataSource.getUrl());
+        if (database != null && database.length() != 0) {
+            return database;
         }
         if (dataSource.getName() != null && dataSource.getName().length() != 0) {
             return dataSource.getName();
@@ -518,6 +524,39 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             }
         }
         return "unknown";
+    }
+
+    /**
+     * 从 JDBC URL 中解析库名，支持 {@code jdbc:<type>://host[:port]/db[?params]} 形式
+     * （MySQL、PostgreSQL 等）。例如 {@code jdbc:mysql://10.108.0.203:3306/crs?useSSL=false} -> {@code crs}。
+     * 解析失败（无 {@code ://}、无路径、路径为空）返回 null。
+     */
+    private static String databaseNameFromUrl(String url) {
+        if (url == null || url.length() == 0) {
+            return null;
+        }
+        int scheme = url.indexOf("://");
+        if (scheme < 0) {
+            return null;
+        }
+        String rest = url.substring(scheme + 3);
+        int slash = rest.indexOf('/');
+        if (slash < 0) {
+            return null;
+        }
+        String path = rest.substring(slash + 1);
+        int query = path.indexOf('?');
+        if (query >= 0) {
+            path = path.substring(0, query);
+        }
+        int semicolon = path.indexOf(';');
+        if (semicolon >= 0) {
+            path = path.substring(0, semicolon);
+        }
+        if (path.length() == 0) {
+            return null;
+        }
+        return path;
     }
 
     /**

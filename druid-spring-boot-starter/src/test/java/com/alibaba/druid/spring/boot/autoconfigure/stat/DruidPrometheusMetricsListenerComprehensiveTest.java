@@ -509,6 +509,19 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
         awaitSqlMeter(registry, "select 1", "inventoryDataSource");
     }
 
+    @Test
+    public void dataSourceName_usesDatabaseFromJdbcUrl() throws Exception {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        DruidPrometheusMetricsListener listener = newListener(defaultConfig(false), registry, null);
+        listener.init();
+        DataSourceProxy ds = mock(DataSourceProxy.class);
+        when(ds.getUrl()).thenReturn("jdbc:mysql://10.108.0.203:3306/crs?useSSL=false");
+
+        listener.onSqlExecute("select 1", ds, 1L, null);
+        // 库名 crs 取自 URL 路径，且已剥离查询参数
+        awaitSqlMeter(registry, "select 1", "crs");
+    }
+
     // ==================== 生命周期 ====================
 
     @Test
