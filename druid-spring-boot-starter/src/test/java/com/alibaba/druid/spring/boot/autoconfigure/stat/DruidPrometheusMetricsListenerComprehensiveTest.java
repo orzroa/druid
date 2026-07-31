@@ -17,7 +17,6 @@ package com.alibaba.druid.spring.boot.autoconfigure.stat;
 
 import com.alibaba.druid.proxy.jdbc.DataSourceProxy;
 import com.alibaba.druid.spring.boot.autoconfigure.properties.DruidStatProperties;
-import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
@@ -27,6 +26,9 @@ import org.junit.Test;
 import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.support.DefaultListableBeanFactory;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
 
 import javax.servlet.http.HttpServletRequest;
 import javax.sql.DataSource;
@@ -54,7 +56,7 @@ import static org.mockito.Mockito.withSettings;
  * <ul>
  *     <li>SQL 事件：执行耗时、影响行数、抓取行数的记录与跳过条件；</li>
  *     <li>Web 事件：URI 模板解析的三级优先级、contextPath 拼接、JDBC 计数；</li>
- *     <li>基数控制：SQL / URI 身份上限丢弃与丢弃计数器；</li>
+ *     <li>基数控制：SQL / URI 身份上限的 LRU 淘汰；</li>
  *     <li>SQL 映射落盘：MD5 文件名、已存在文件不覆盖、关闭后不落盘；</li>
  *     <li>配置热刷新：{@code refresh} 启用/禁用、null 忽略；</li>
  *     <li>数据源名解析：getName / BeanFactory 反查 / unknown；</li>
@@ -246,7 +248,7 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
     // ==================== SQL 身份上限 ====================
 
     @Test
-    public void sqlIdentityLimit_dropsNewSqlBeyondLimit() throws Exception {
+    public void sqlIdentityLimit_evictsLeastRecentlyUsedSql() throws Exception {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
         DruidStatProperties.Prometheus config = defaultConfig(false);
         config.getEvents().setMaxSqlIdentities(2);
@@ -256,15 +258,15 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
 
         listener.onSqlExecute("select 1", ds, 1L, null);
         listener.onSqlExecute("select 2", ds, 1L, null);
-        listener.onSqlExecute("select 3", ds, 1L, null); // 超出上限，丢弃
+        listener.onSqlExecute("select 1", ds, 1L, null); // 刷新 select 1 的访问顺序
+        listener.onSqlExecute("select 3", ds, 1L, null); // 淘汰最久未使用的 select 2
 
         awaitSqlMeter(registry, "select 1", "primary");
-        awaitSqlMeter(registry, "select 2", "primary");
+        awaitSqlMeter(registry, "select 3", "primary");
 
         assertEquals(2, registry.find("druid.sql.execution.duration").meters().size());
-        Counter dropped = registry.find("druid.prometheus.meter.dropped").tag("type", "sql").counter();
-        assertNotNull(dropped);
-        assertEquals(1.0, dropped.count(), 0.0);
+        assertEquals(null, registry.find("druid.sql.execution.duration")
+                .tags("sql", hash("select 2"), "datasource", "primary").timer());
     }
 
     // ==================== SQL 映射落盘 ====================
@@ -432,7 +434,7 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
     }
 
     @Test
-    public void uriIdentityLimit_dropsOnlyNewUri() {
+    public void uriIdentityLimit_evictsLeastRecentlyUsedUri() {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
         DruidStatProperties.Prometheus config = defaultConfig(false);
         config.getEvents().setMaxUriIdentities(1);
@@ -443,9 +445,8 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
         listener.onWebRequest(request(null, ""), "/two", 1L, 0, 0, 0, null);
 
         assertEquals(1, registry.find("druid.uri.request.duration").meters().size());
-        Counter dropped = registry.find("druid.prometheus.meter.dropped").tag("type", "uri").counter();
-        assertNotNull(dropped);
-        assertEquals(1.0, dropped.count(), 0.0);
+        assertEquals(null, registry.find("druid.uri.request.duration").tag("uri", "/one").timer());
+        assertNotNull(registry.find("druid.uri.request.duration").tag("uri", "/two").timer());
     }
 
     // ==================== 配置热刷新 ====================
@@ -461,6 +462,27 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
         listener.refresh(null); // 忽略
         listener.onWebRequest(request(null, ""), "/orders", 1L, 0, 0, 0, null);
         assertEquals(0, registry.find("druid.uri.request.duration").meters().size());
+    }
+
+    @Test
+    public void refresh_identityLimitTrimsLruOnNextEvent() {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        DruidStatProperties.Prometheus config = defaultConfig(false);
+        config.getEvents().setMaxUriIdentities(2);
+        DruidPrometheusMetricsListener listener = newListener(config, registry, null);
+        listener.init();
+
+        listener.onWebRequest(request(null, ""), "/one", 1L, 0, 0, 0, null);
+        listener.onWebRequest(request(null, ""), "/two", 1L, 0, 0, 0, null);
+
+        DruidStatProperties.Prometheus refreshed = defaultConfig(false);
+        refreshed.getEvents().setMaxUriIdentities(1);
+        listener.refresh(refreshed);
+        listener.onWebRequest(request(null, ""), "/two", 1L, 0, 0, 0, null);
+
+        assertEquals(1, registry.find("druid.uri.request.duration").meters().size());
+        assertEquals(null, registry.find("druid.uri.request.duration").tag("uri", "/one").timer());
+        assertNotNull(registry.find("druid.uri.request.duration").tag("uri", "/two").timer());
     }
 
     @Test
@@ -535,13 +557,24 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
     }
 
     @Test
-    public void init_registersDroppedCounters() {
+    public void init_doesNotRegisterDroppedCounters() {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
         DruidPrometheusMetricsListener listener = newListener(defaultConfig(false), registry, null);
         listener.init();
 
-        assertNotNull(registry.find("druid.prometheus.meter.dropped").tag("type", "sql").counter());
-        assertNotNull(registry.find("druid.prometheus.meter.dropped").tag("type", "uri").counter());
+        assertEquals(0, registry.find("druid.prometheus.meter.dropped").meters().size());
+    }
+
+    @Test
+    public void configuration_registersListenerWhenEnabledPropertyIsMissing() {
+        AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext();
+        context.register(MetricsConfiguration.class, DruidPrometheusMetricsConfiguration.class);
+        context.refresh();
+        try {
+            assertTrue(context.containsBean("druidPrometheusMetricsListener"));
+        } finally {
+            context.close();
+        }
     }
 
     @Test
@@ -577,9 +610,6 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
             // 全部 SQL 都应建出 Meter，无丢弃
             awaitCondition(5_000L, () -> registry.find("druid.sql.execution.duration").meters().size() == total);
             assertEquals(total, registry.find("druid.sql.execution.duration").meters().size());
-            Counter dropped = registry.find("druid.prometheus.meter.dropped").tag("type", "sql").counter();
-            long droppedCount = dropped == null ? 0L : (long) dropped.count();
-            assertEquals(0L, droppedCount);
         } finally {
             deleteRecursively(dir);
         }
@@ -664,5 +694,18 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
             @Override public T getIfUnique() throws BeansException { return value; }
             @Override public T getObject() throws BeansException { return value; }
         };
+    }
+
+    @Configuration
+    static class MetricsConfiguration {
+        @Bean
+        public MeterRegistry meterRegistry() {
+            return new SimpleMeterRegistry();
+        }
+
+        @Bean
+        public DruidStatProperties druidStatProperties() {
+            return new DruidStatProperties();
+        }
     }
 }

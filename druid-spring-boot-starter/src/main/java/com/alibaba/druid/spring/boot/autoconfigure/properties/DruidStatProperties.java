@@ -190,7 +190,6 @@ public class DruidStatProperties {
             private int maxSqlIdentities = 1000;
             private int maxUriIdentities = 1000;
             private String maxWindow = "2m";
-            private long logStep = 1000;
 
             public boolean isEnabled() { return enabled; }
             public void setEnabled(boolean enabled) { this.enabled = enabled; }
@@ -200,8 +199,6 @@ public class DruidStatProperties {
             public void setMaxUriIdentities(int maxUriIdentities) { this.maxUriIdentities = maxUriIdentities; }
             public String getMaxWindow() { return maxWindow; }
             public void setMaxWindow(String maxWindow) { this.maxWindow = maxWindow; }
-            public long getLogStep() { return logStep; }
-            public void setLogStep(long logStep) { this.logStep = logStep; }
         }
 
         public static class UriTemplate {

@@ -242,15 +242,9 @@ API，但会面临 Filter 顺序、异常路径、异步请求和与 Druid StatF
 资源边界。必须具备：
 
 - SQL 与 URI 分别设置 Meter 上限，默认值均为 1000。
-- 超限后的策略：拒绝新序列、聚合到 `other`，或按 TTL 删除；推荐“拒绝新序列 +
-  增加丢弃计数器”，避免 `other` 隐藏热点。
-- D7 可观测性已确认：超限时拒绝新序列，同时记录辅助指标
-  `druid_prometheus_meter_dropped_total{type="sql|uri"}`；该计数大于 0 即表示
-  已经达到过上限，不再额外注册重复的 limit-reached Gauge。另发出按丢弃次数步长
-  触发的 WARN 日志：每种类型
-  首次丢弃时立即记录，之后每新增默认 1000 次丢弃记录一条，并汇总累计丢弃数量，
-  不打印具体 SQL 或 URI。这样既能知道丢弃了多少，也能直接告警“已经达到上限”。
-  这些是资源保护辅助指标，不属于前述 7 个业务 Meter。
+- 超限后的策略：拒绝新序列、聚合到 `other`，按 TTL 删除，或按 LRU 淘汰；本实现
+  使用近似 LRU，以保留当前活跃的序列且不引入额外的聚合标签或 dropped 指标。正常命中
+  只更新时间戳，序列创建或淘汰时才加锁，因此并发下访问顺序和上限可能短暂存在轻微偏差。
 - SQL 标签不使用原文：D4 已确认，严格沿用 druid2prom，取 Druid 最终统计 SQL
   文本的 UTF-8 MD5，输出 32 位小写十六进制。每个新 hash 首次出现时，将
   `hash -> SQL` 写入可配置的本地映射目录；每个 SQL 一个文件，文件名就是 32 位
@@ -268,9 +262,8 @@ API，但会面临 Filter 顺序、异常路径、异步请求和与 Druid StatF
 - D5 已确认：URI 模板优先级为“应用自定义 URI 模板 SPI → Spring MVC 已匹配模板
   → Druid 原始 URI”；非 Spring MVC 且无自定义模板时允许回退原始 URI。模板标签
   去掉 context path；无稳定数据源名称时使用固定值 `unknown`。
-- D7 已确认：SQL 与 URI 分别设置上限 1000；超限后永久拒绝新序列（直到进程重启），
-  不主动删除已有 Meter；丢弃指标仅按 `type="sql|uri"` 区分；WARN 首次立即输出，
-  之后每新增 1000 次丢弃输出一条；上限调整只影响后续新序列。
+- SQL 与 URI 分别设置上限 1000；达到上限时按近似 LRU 淘汰最久未使用的序列，
+  并从 MeterRegistry 注销其 Meter。上限调整会在后续事件访问时生效。
 - SQL identity 进入 PENDING 状态时即占用 `max-sql-identities` 配额；它不能借由
   等待异步映射写盘而绕过上限。
 - 禁用采集时停止后续事件记录；不删除或重建任何已有 Meter，尤其不影响业务已有
@@ -288,7 +281,6 @@ spring.datasource.druid.prometheus.events.enabled=true
 spring.datasource.druid.prometheus.events.max-sql-identities=1000
 spring.datasource.druid.prometheus.events.max-uri-identities=1000
 spring.datasource.druid.prometheus.events.max-window=2m
-spring.datasource.druid.prometheus.events.log-step=1000
 spring.datasource.druid.prometheus.sql-mapping.enabled=true
 spring.datasource.druid.prometheus.sql-mapping.directory=./logs/druid/sql-mapping
 spring.datasource.druid.prometheus.sql-mapping.queue-size=1000
@@ -298,11 +290,11 @@ spring.datasource.druid.prometheus.uri-template.include-context-path=false
 不提供 `reset-all` 或任何 destructive reset 配置。
 
 配置语义：`max-sql-identities` 限制不同的 `(sql, datasource)` 标签组合，
-`max-uri-identities` 限制不同的 `uri` 标签值；`max-window` 只影响近期
+`max-uri-identities` 限制不同的 `uri` 标签值；两个上限均按近似 LRU 缓存执行，达到
+上限时淘汰最久未使用的身份；`max-window` 只影响近期
 `_max`，不影响累计 `_count`/`_sum`。实现固定 `bufferLength=2`，并将任意
 `max-window` 均分为两个 `expiry` 时间片；默认 2 分钟即 `expiry=1m`。
-`log-step` 控制首次及每新增多少次丢弃输出
-一条 WARN；SQL 映射目录按 MD5 文件名保存单条 SQL，待写状态用于避免重复提交，
+SQL 映射目录按 MD5 文件名保存单条 SQL，待写状态用于避免重复提交，
 `queue-size` 限制单写线程的待写任务数；
 URI 模板固定采用“应用 SPI → Spring MVC 模板 → 原始 URI”的优先级。
 Histogram 不提供配置项，按 D8 永久关闭。
@@ -310,7 +302,7 @@ Histogram 不提供配置项，按 D8 永久关闭。
 运行时需要替换配置时，应用可取得 starter 暴露的
 `DruidPrometheusMetricsRefresher` 并调用 `refresh(Prometheus)`；替换对事件路径
 原子生效，不删除或重建已有 Meter，`max-window` 仅作用于之后新建的 Meter。
-`enabled`、`events.enabled`、两个 identity 上限、`log-step`、SQL 映射开关与目录、
+`enabled`、`events.enabled`、两个 identity 上限、SQL 映射开关与目录、
 以及 URI context-path 开关，对后续事件立即生效；`max-window` 仅对新建 Meter
 生效；`sql-mapping.queue-size` 仅在映射写线程创建时读取，修改后需重启才能生效。
 
@@ -322,7 +314,7 @@ Histogram 不提供配置项，按 D8 永久关闭。
 - 并发测试：listener 慢或抛异常时，不影响 SQL 与 Web 请求。
 - 映射写盘测试：并发相同 identity 只提交一次；已有 MD5 文件不重写；PENDING 占用
   上限；队列满、写失败和应用重启后的重试不阻塞 SQL。
-- 基数测试：达到上限时不新增 Meter，并暴露丢弃计数。
+- 基数测试：达到上限时淘汰最久未使用的 Meter，并保持实际 Meter 数不超过上限。
 - Web 测试：4xx/5xx 记录 URI Timer，`isAsyncStarted()` 请求不记录 URI 事件。
 - 多数据源测试：全局数据源去重、SQL 标识的处理符合决定的语义。
 - 删除测试：确认不再注册旧 19 项、不再访问 JSON URL、也不启动周期刷新线程。
@@ -345,7 +337,7 @@ Histogram 不提供配置项，按 D8 永久关闭。
 | D4 | SQL 标签及查证 | 严格沿用 druid2prom：Druid 最终统计 SQL 的 UTF-8 MD5（32 位小写），每个 SQL 一个文件，文件名为该 hash。 |
 | D5 | URI 标签 | 自定义 SPI → Spring MVC 模板 → 原始 URI；模板去掉 context path；无模板 404 保持 Druid `<contextPath>error_404`。 |
 | D6 | 多数据源语义 | SQL 使用稳定 `datasource` 标签，名称取显式配置名 → Bean 名 → `unknown`；URI 不带该标签；上限按 `sql × datasource` 计算。 |
-| D7 | 标签基数与资源保护 | SQL/URI 分别设置上限 1000；超限永久拒绝新序列，不删除已有 Meter；提供 dropped counter；首次及每新增 1000 次输出 WARN；调整只影响后续序列。 |
+| D7 | 标签基数与资源保护 | SQL/URI 分别设置上限 1000；达到上限时按近似 LRU 淘汰最久未使用的序列，并从 Registry 注销对应 Meter。 |
 | D8 | Histogram | 不启用 Histogram | 只保留 count、sum、max；平均值通过 sum/count 计算，不产生 bucket 或 percentile 状态。 |
 | D9 | 异常语义 | SQL 失败不记录；HTTP 全部记录 | SQL 语法、连接、超时、锁、约束等失败不进入 SQL 三个 Meter；HTTP 请求无论成功、4xx 或 5xx 均记录 URI Timer；失败 SQL 的行数不记录。 |
 | D10 | 配置与默认值 | 配置快照原子替换；可选刷新适配器 | 配置有默认值；支持通过刷新 SPI 动态替换快照。已有 Meter 不因配置刷新删除或重建。 |
@@ -354,10 +346,10 @@ Histogram 不提供配置项，按 D8 永久关闭。
 | D13 | URI 模板 SPI 生命周期 | 仅同步请求；异步请求后续增强 | 已确认：本期只统计同步 Servlet 请求；检测到 `request.isAsyncStarted()` 时跳过 URI 事件，禁止按 Filter 提前返回时间记录残缺数据。 |
 | D14 | SQL MD5 冲突 | 忽略碰撞；检测告警；增加冲突后缀 | 已确认：严格沿用 MD5 标签算法，忽略碰撞，不增加后缀、不改变标签；映射文件按原 hash 文件名写入。 |
 | D15 | SQL 映射文件安全 | 目录落盘；关闭落盘 | 一个 SQL 一个文件，文件名为 MD5；写入失败只限频 WARN，不影响 SQL；目标存在即跳过，否则使用临时文件加原子移动，目录和权限由部署环境负责。 |
-| D16 | 辅助保护指标 | 纳入 7 个业务 Meter；独立辅助指标 | 已确认：只保留独立的 `druid_prometheus_meter_dropped_total{type="sql|uri"}`；不注册重复的 limit-reached Gauge；不计入 7 个业务 Meter。 |
+| D16 | 辅助保护指标 | 纳入 7 个业务 Meter；独立辅助指标 | 不提供 dropped 辅助指标。 |
 | D20 | URI 模板模式 | 固定 auto；允许多模式配置 | 已确认：删除 `uri-template.mode` 配置项，固定采用应用 SPI → Spring MVC 模板 → 原始 URI。 |
 | D17 | 上限的计数单位 | 标签身份组合 | SQL 上限按不同 `(sql, datasource)` 组合计数，URI 上限按不同 `uri` 计数；配置名使用 `max-sql-identities` / `max-uri-identities`。 |
-| D18 | SQL 映射写盘线程 | 有界异步单写线程 | 每次先计算 MD5，再用 `ConcurrentHashMap.putIfAbsent` 无全局锁地预留 `(sql,datasource)` identity；只有预留成功者入队。写线程先判断 MD5 文件是否存在，存在则跳过，不存在才写临时文件并原子移动；完成后状态变为 READY 并注册 Meter。队列满或写失败不阻塞 SQL，限频 WARN，并在下次执行时重试；PENDING 期间的首次观测允许丢弃。 |
+| D18 | SQL 映射写盘线程 | 有界异步单写线程 | 新 SQL Meter 同步创建并加入近似 LRU，SQL 映射写线程异步落盘。写线程先判断 MD5 文件是否存在，存在则跳过，不存在才写临时文件并原子移动；队列满或写失败不阻塞 SQL，仅跳过本次落盘。 |
 | D19 | SQL hash 计算 | 每次计算；内容缓存 | 已确认：每次执行都按 D4 重新计算 UTF-8 MD5，不缓存 SQL 原文到 hash；仅保留待写状态避免重复提交文件任务。 |
 
 ### 11.2 待逐项讨论

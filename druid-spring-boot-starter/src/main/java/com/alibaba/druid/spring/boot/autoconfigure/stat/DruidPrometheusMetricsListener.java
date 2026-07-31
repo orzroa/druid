@@ -21,13 +21,11 @@ import com.alibaba.druid.proxy.jdbc.DataSourceProxy;
 import com.alibaba.druid.spring.boot.autoconfigure.properties.DruidStatProperties;
 import com.alibaba.druid.support.http.WebStatEventContext;
 import com.alibaba.druid.support.http.WebStatEventListener;
-import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.DistributionSummary;
+import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.BeanFactory;
 import org.springframework.beans.factory.BeanFactoryAware;
@@ -53,8 +51,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 将 Druid 原生的统计事件（SQL 执行、Web 请求）记录到应用已有的 {@link MeterRegistry} 中，
@@ -73,13 +69,11 @@ import java.util.concurrent.atomic.AtomicLong;
  *     <li>不自行启动周期性刷新线程，也不再通过旧的 JSON 端点暴露指标；</li>
  *     <li>使用唯一的单写线程（{@link #mappingExecutor}）把 SQL 文本按 MD5 落盘，
  *         避免重复提交与阻塞业务事件路径；</li>
- *     <li>对 SQL / URI 的标签基数（-identity 上限）做了限制，超出后丢弃并计数，防止 Meter 爆炸。</li>
+ *     <li>对 SQL / URI 的标签基数（-identity 上限）使用近似 LRU 缓存，淘汰最久未使用的 Meter，防止 Meter 爆炸。</li>
  * </ul>
  */
 public final class DruidPrometheusMetricsListener implements StatFilterEventListener, WebStatEventListener,
         DruidPrometheusMetricsRefresher, BeanFactoryAware {
-    private static final Logger LOG = LoggerFactory.getLogger(DruidPrometheusMetricsListener.class);
-
     /** Spring MVC 在请求属性中存放“最佳匹配路径模板”的 key，例如 {@code /users/{id}}。 */
     private static final String SPRING_MVC_PATTERN_ATTRIBUTE =
             "org.springframework.web.servlet.HandlerMapping.bestMatchingPattern";
@@ -93,32 +87,23 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
 
     /**
      * 以 {@code (sqlMd5 + '\u0000' + dataSourceName)} 为 key 缓存的 SQL 状态。
-     * 首次见到的 SQL 会异步计算 Meter，之后再出现则复用已有 Meter。
+     * 首次见到的 SQL 会创建 Meter，之后再出现则复用已有 Meter。
      */
     private final ConcurrentMap<String, SqlState> sqlStates = new ConcurrentHashMap<String, SqlState>();
     /** 以 URI 模板为 key 缓存的 URI 指标 Meter。 */
     private final ConcurrentMap<String, UriMeters> uriMeters = new ConcurrentHashMap<String, UriMeters>();
+    /** 仅序列注册/淘汰时使用，正常命中路径不获取此锁。 */
+    private final Object sqlMeterLock = new Object();
+    /** 仅序列注册/淘汰时使用，正常命中路径不获取此锁。 */
+    private final Object uriMeterLock = new Object();
     /** 记录 DataSourceProxy 实例到其 Spring Bean 名称的映射，避免反复扫描容器。 */
     private final ConcurrentMap<DataSourceProxy, String> dataSourceBeanNames =
             new ConcurrentHashMap<DataSourceProxy, String>();
-
-    /** 已注册的 SQL 身份（不同 (sql, datasource) 组合）计数，用于基数上限控制。 */
-    private final AtomicInteger sqlIdentityCount = new AtomicInteger();
-    /** 已注册的 URI 身份计数，用于基数上限控制。 */
-    private final AtomicInteger uriIdentityCount = new AtomicInteger();
-    /** 因超出 SQL 基数上限而被丢弃的观测计数。 */
-    private final AtomicLong sqlDropped = new AtomicLong();
-    /** 因超出 URI 基数上限而被丢弃的观测计数。 */
-    private final AtomicLong uriDropped = new AtomicLong();
 
     /** 实际取出并缓存的 MeterRegistry；为 null 时表示未启用指标，所有事件都会被跳过。 */
     private volatile MeterRegistry meterRegistry;
     /** 单线程、有界队列的 SQL 映射落盘执行器。 */
     private volatile ThreadPoolExecutor mappingExecutor;
-    /** “被丢弃的 SQL 观测”计数器（注册到 MeterRegistry）。 */
-    private volatile Counter sqlDroppedCounter;
-    /** “被丢弃的 URI 观测”计数器（注册到 MeterRegistry）。 */
-    private volatile Counter uriDroppedCounter;
     /** 容器工厂（用于反查 DataSource Bean 名）；非 ListableBeanFactory 时为 null。 */
     private volatile ListableBeanFactory beanFactory;
 
@@ -138,7 +123,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     }
 
     /**
-     * 初始化：取出 MeterRegistry，并在可用时创建落盘线程、丢弃计数器和事件监听注册。
+     * 初始化：取出 MeterRegistry，并在可用时创建落盘线程和事件监听注册。
      * 若容器中没有 MeterRegistry，则直接返回（指标功能视为关闭）。
      */
     @PostConstruct
@@ -152,11 +137,6 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         mappingExecutor = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<Runnable>(queueSize), new MappingThreadFactory(),
                 new ThreadPoolExecutor.AbortPolicy());
-        // 这两个 Counter 用于观测“因基数上限被丢弃”的情况，便于排查指标丢失
-        sqlDroppedCounter = Counter.builder("druid.prometheus.meter.dropped")
-                .tags("type", "sql").register(meterRegistry);
-        uriDroppedCounter = Counter.builder("druid.prometheus.meter.dropped")
-                .tags("type", "uri").register(meterRegistry);
         // 向 Druid 注册自己，开始接收 SQL / Web 事件
         StatFilterContext.getInstance().addEventListener(this);
         WebStatEventContext.addListener(this);
@@ -177,7 +157,8 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
 
     /**
      * {@link DruidPrometheusMetricsRefresher} 的实现：在运行时原子替换配置快照。
-     * 只替换非 null 的参数；对后续事件立即生效，不影响已注册的 Meter。
+     * 只替换非 null 的参数；对后续事件立即生效。identity 上限缩小时，下一次访问
+     * 对应类型的事件会按近似 LRU 淘汰多余 Meter。
      *
      * @param config 新的 Prometheus 配置快照
      */
@@ -257,21 +238,9 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         if (template == null || template.length() == 0) {
             return;
         }
-        // 懒创建 URI 对应的 Meter（double-checked 锁保证单例）
-        UriMeters meters = uriMeters.get(template);
+        UriMeters meters = uriMeters(template);
         if (meters == null) {
-            synchronized (uriMeters) {
-                meters = uriMeters.get(template);
-                if (meters == null) {
-                    meters = createUriMeters(template);
-                    if (meters == null) {
-                        // 达到 URI 基数上限，创建失败
-                        dropUri();
-                        return;
-                    }
-                    uriMeters.put(template, meters);
-                }
-            }
+            return;
         }
         meters.timer.record(durationNanos, TimeUnit.NANOSECONDS);
         if (jdbcExecuteCount >= 0) meters.jdbcExecutions.record(jdbcExecuteCount);
@@ -288,9 +257,11 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
 
     /**
      * 取得（必要时懒创建）某个 SQL 的 {@link SqlState}。
-     * 内部维护 SQL 身份计数，超过 {@code max-sql-identities} 上限时丢弃该观测。
+     * 内部维护近似 LRU 缓存。正常命中仅更新时间戳，不获取互斥锁；超过
+     * {@code max-sql-identities} 上限时，
+     * 淘汰最久未使用的 Meter，并为当前 SQL 创建新的 Meter。
      *
-     * @return SQL 状态；若被丢弃或无法处理则返回 null
+     * @return SQL 状态；无法处理时返回 null
      */
     private SqlState sqlState(String sql, DataSourceProxy dataSource) {
         String hash = calculateSqlMd5(sql);
@@ -301,41 +272,61 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         String key = hash + '\u0000' + dataSourceName;
         SqlState current = sqlStates.get(key);
         if (current != null) {
+            current.touch();
+            trimSqlStatesIfNecessary();
             return current;
         }
-        // 超过 SQL 身份上限：撤销计数并丢弃
-        if (sqlIdentityCount.incrementAndGet() > Math.max(1, config.getEvents().getMaxSqlIdentities())) {
-            sqlIdentityCount.decrementAndGet();
-            dropSql();
-            return null;
+        synchronized (sqlMeterLock) {
+            current = sqlStates.get(key);
+            if (current != null) {
+                current.touch();
+                trimSqlStates(maxSqlIdentities());
+                return current;
+            }
+            trimSqlStates(maxSqlIdentities() - 1);
+            SqlState candidate = new SqlState(hash, dataSourceName, sql);
+            try {
+                candidate.meters = createSqlMeters(candidate.hash, candidate.dataSource);
+            } catch (RuntimeException e) {
+                return null;
+            }
+            sqlStates.put(key, candidate);
+            submitMapping(candidate);
+            return candidate;
         }
-        SqlState candidate = new SqlState(hash, dataSourceName, sql);
-        SqlState existing = sqlStates.putIfAbsent(key, candidate);
-        if (existing != null) {
-            // 并发下被别的线程抢先创建，撤销本地计数
-            sqlIdentityCount.decrementAndGet();
-            return existing;
+    }
+
+    /** 获取 URI 的近似 LRU Meter；新 URI 会淘汰最久未使用的 Meter。 */
+    private UriMeters uriMeters(String template) {
+        UriMeters meters = uriMeters.get(template);
+        if (meters != null) {
+            meters.touch();
+            trimUriMetersIfNecessary();
+            return meters;
         }
-        // 同步创建 Meter，使首次执行即可被记录；SQL 文本映射仍异步落盘。
-        // Meter 注册只是 MeterRegistry 内部的 ConcurrentHashMap 写入（微秒级），
-        // 不会阻塞 JDBC 事件路径；真正耗时的文件落盘仍由 submitMapping 异步完成。
-        try {
-            candidate.meters = createSqlMeters(candidate.hash, candidate.dataSource);
-        } catch (RuntimeException e) {
-            sqlStates.remove(key, candidate);
-            sqlIdentityCount.decrementAndGet();
-            dropSql("SQL meter creation failed");
-            return null;
+        synchronized (uriMeterLock) {
+            meters = uriMeters.get(template);
+            if (meters != null) {
+                meters.touch();
+                trimUriMeters(maxUriIdentities());
+                return meters;
+            }
+            trimUriMeters(maxUriIdentities() - 1);
+            try {
+                meters = createUriMeters(template);
+            } catch (RuntimeException e) {
+                return null;
+            }
+            uriMeters.put(template, meters);
+            return meters;
         }
-        submitMapping(candidate, key);
-        return candidate;
     }
 
     /**
      * 把“写 SQL 映射文件”的任务提交给落盘线程（Meter 已在 {@link #sqlState} 中同步创建）。
      * 若线程不可用或队列已满，仅跳过落盘，不丢弃已创建的 Meter，避免丢失观测。
      */
-    private void submitMapping(final SqlState state, final String key) {
+    private void submitMapping(final SqlState state) {
         ThreadPoolExecutor executor = mappingExecutor;
         if (executor == null) {
             // 无落盘线程：保留 Meter，仅释放 SQL 原文
@@ -374,16 +365,26 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     private SqlMeters createSqlMeters(String hash, String dataSource) {
         Tags tags = Tags.of("sql", hash, "datasource", dataSource);
         Duration expiry = maxWindow().dividedBy(2);
-        Timer timer = Timer.builder("druid.sql.execution.duration")
-                .tags(tags).distributionStatisticExpiry(expiry)
-                .distributionStatisticBufferLength(2).register(meterRegistry);
-        DistributionSummary affected = DistributionSummary.builder("druid.sql.affected.rows")
-                .tags(tags).distributionStatisticExpiry(expiry)
-                .distributionStatisticBufferLength(2).register(meterRegistry);
-        DistributionSummary fetched = DistributionSummary.builder("druid.sql.fetched.rows")
-                .tags(tags).distributionStatisticExpiry(expiry)
-                .distributionStatisticBufferLength(2).register(meterRegistry);
-        return new SqlMeters(timer, affected, fetched);
+        Timer timer = null;
+        DistributionSummary affected = null;
+        DistributionSummary fetched = null;
+        try {
+            timer = Timer.builder("druid.sql.execution.duration")
+                    .tags(tags).distributionStatisticExpiry(expiry)
+                    .distributionStatisticBufferLength(2).register(meterRegistry);
+            affected = DistributionSummary.builder("druid.sql.affected.rows")
+                    .tags(tags).distributionStatisticExpiry(expiry)
+                    .distributionStatisticBufferLength(2).register(meterRegistry);
+            fetched = DistributionSummary.builder("druid.sql.fetched.rows")
+                    .tags(tags).distributionStatisticExpiry(expiry)
+                    .distributionStatisticBufferLength(2).register(meterRegistry);
+            return new SqlMeters(timer, affected, fetched);
+        } catch (RuntimeException e) {
+            removeMeter(timer);
+            removeMeter(affected);
+            removeMeter(fetched);
+            throw e;
+        }
     }
 
     /**
@@ -394,29 +395,36 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
      *     <li>{@code druid.uri.jdbc.affected.rows} — 影响行数；</li>
      *     <li>{@code druid.uri.jdbc.fetched.rows} — 抓取行数。</li>
      * </ul>
-     * 受 {@code max-uri-identities} 上限约束，超出返回 null（由调用方丢弃）。
+     * 上限由调用方的近似 LRU 缓存控制。
      */
     private UriMeters createUriMeters(String uri) {
-        if (uriIdentityCount.incrementAndGet() > Math.max(1, config.getEvents().getMaxUriIdentities())) {
-            uriIdentityCount.decrementAndGet();
-            return null;
-        }
         Tags tags = Tags.of("uri", uri);
         Duration expiry = maxWindow().dividedBy(2);
-        UriMeters meters = new UriMeters(
-                Timer.builder("druid.uri.request.duration").tags(tags)
-                        .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2)
-                        .register(meterRegistry),
-                DistributionSummary.builder("druid.uri.jdbc.executions").tags(tags)
-                        .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2)
-                        .register(meterRegistry),
-                DistributionSummary.builder("druid.uri.jdbc.affected.rows").tags(tags)
-                        .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2)
-                        .register(meterRegistry),
-                DistributionSummary.builder("druid.uri.jdbc.fetched.rows").tags(tags)
-                        .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2)
-                        .register(meterRegistry));
-        return meters;
+        Timer timer = null;
+        DistributionSummary executions = null;
+        DistributionSummary affectedRows = null;
+        DistributionSummary fetchedRows = null;
+        try {
+            timer = Timer.builder("druid.uri.request.duration").tags(tags)
+                    .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2)
+                    .register(meterRegistry);
+            executions = DistributionSummary.builder("druid.uri.jdbc.executions").tags(tags)
+                    .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2)
+                    .register(meterRegistry);
+            affectedRows = DistributionSummary.builder("druid.uri.jdbc.affected.rows").tags(tags)
+                    .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2)
+                    .register(meterRegistry);
+            fetchedRows = DistributionSummary.builder("druid.uri.jdbc.fetched.rows").tags(tags)
+                    .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2)
+                    .register(meterRegistry);
+            return new UriMeters(timer, executions, affectedRows, fetchedRows);
+        } catch (RuntimeException e) {
+            removeMeter(timer);
+            removeMeter(executions);
+            removeMeter(affectedRows);
+            removeMeter(fetchedRows);
+            throw e;
+        }
     }
 
     /**
@@ -581,30 +589,100 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         return Duration.ofMinutes(2);
     }
 
-    /** 因达到 SQL 身份上限而丢弃一次观测。 */
-    private void dropSql() {
-        dropSql("identity limit " + config.getEvents().getMaxSqlIdentities() + " reached");
+    /** 当前 SQL 近似 LRU 容量，非法值仍保留一个身份以保证事件可被采集。 */
+    private int maxSqlIdentities() {
+        return Math.max(1, config.getEvents().getMaxSqlIdentities());
     }
 
-    /** 记录一次 SQL 观测被丢弃（计数 + 周期性 WARN 日志）。 */
-    private void dropSql(String reason) {
-        long dropped = sqlDropped.incrementAndGet();
-        if (sqlDroppedCounter != null) sqlDroppedCounter.increment();
-        warnDropped("SQL", dropped, reason);
+    /** 当前 URI 近似 LRU 容量，非法值仍保留一个身份以保证事件可被采集。 */
+    private int maxUriIdentities() {
+        return Math.max(1, config.getEvents().getMaxUriIdentities());
     }
 
-    /** 因达到 URI 身份上限而丢弃一次观测。 */
-    private void dropUri() {
-        long dropped = uriDropped.incrementAndGet();
-        if (uriDroppedCounter != null) uriDroppedCounter.increment();
-        warnDropped("URI", dropped, "identity limit " + config.getEvents().getMaxUriIdentities() + " reached");
+    /** 上限缩小时，命中路径才进入短临界区执行淘汰。 */
+    private void trimSqlStatesIfNecessary() {
+        if (sqlStates.size() <= maxSqlIdentities()) {
+            return;
+        }
+        synchronized (sqlMeterLock) {
+            trimSqlStates(maxSqlIdentities());
+        }
     }
 
-    /** 按 {@code log-step} 间隔输出丢弃告警，避免高频丢弃刷屏。 */
-    private void warnDropped(String type, long dropped, String reason) {
-        long step = Math.max(1L, config.getEvents().getLogStep());
-        if (dropped == 1L || (dropped - 1L) % step == 0L) {
-            LOG.warn("Druid Prometheus {} meter was dropped: {}; dropped {} in total", type, reason, dropped);
+    /** 上限缩小时，命中路径才进入短临界区执行淘汰。 */
+    private void trimUriMetersIfNecessary() {
+        if (uriMeters.size() <= maxUriIdentities()) {
+            return;
+        }
+        synchronized (uriMeterLock) {
+            trimUriMeters(maxUriIdentities());
+        }
+    }
+
+    /** 将 SQL 近似 LRU 缩减到指定容量，并从 Registry 注销被淘汰的 Meter。调用方持有 sqlMeterLock。 */
+    private void trimSqlStates(int maximumSize) {
+        while (sqlStates.size() > maximumSize) {
+            Map.Entry<String, SqlState> oldest = oldestSqlState();
+            if (oldest == null || !sqlStates.remove(oldest.getKey(), oldest.getValue())) {
+                return;
+            }
+            removeSqlMeters(oldest.getValue().meters);
+        }
+    }
+
+    /** 将 URI 近似 LRU 缩减到指定容量，并从 Registry 注销被淘汰的 Meter。调用方持有 uriMeterLock。 */
+    private void trimUriMeters(int maximumSize) {
+        while (uriMeters.size() > maximumSize) {
+            Map.Entry<String, UriMeters> oldest = oldestUriMeters();
+            if (oldest == null || !uriMeters.remove(oldest.getKey(), oldest.getValue())) {
+                return;
+            }
+            removeUriMeters(oldest.getValue());
+        }
+    }
+
+    private Map.Entry<String, SqlState> oldestSqlState() {
+        Map.Entry<String, SqlState> oldest = null;
+        for (Map.Entry<String, SqlState> entry : sqlStates.entrySet()) {
+            if (oldest == null || entry.getValue().lastAccessNanos < oldest.getValue().lastAccessNanos) {
+                oldest = entry;
+            }
+        }
+        return oldest;
+    }
+
+    private Map.Entry<String, UriMeters> oldestUriMeters() {
+        Map.Entry<String, UriMeters> oldest = null;
+        for (Map.Entry<String, UriMeters> entry : uriMeters.entrySet()) {
+            if (oldest == null || entry.getValue().lastAccessNanos < oldest.getValue().lastAccessNanos) {
+                oldest = entry;
+            }
+        }
+        return oldest;
+    }
+
+    private void removeSqlMeters(SqlMeters meters) {
+        removeMeter(meters.timer);
+        removeMeter(meters.affectedRows);
+        removeMeter(meters.fetchedRows);
+    }
+
+    private void removeUriMeters(UriMeters meters) {
+        removeMeter(meters.timer);
+        removeMeter(meters.jdbcExecutions);
+        removeMeter(meters.jdbcAffectedRows);
+        removeMeter(meters.jdbcFetchedRows);
+    }
+
+    /** 创建失败时尽力回收已注册的 Meter，回收异常不覆盖原始注册异常。 */
+    private void removeMeter(Meter meter) {
+        if (meter == null) {
+            return;
+        }
+        try {
+            meterRegistry.remove(meter);
+        } catch (RuntimeException ignored) {
+            // Meter 注册失败的错误不能影响业务事件路径。
         }
     }
 
@@ -634,8 +712,12 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         private final String dataSource;
         private volatile String sql;
         private volatile SqlMeters meters;
+        private volatile long lastAccessNanos;
         private SqlState(String hash, String dataSource, String sql) {
-            this.hash = hash; this.dataSource = dataSource; this.sql = sql;
+            this.hash = hash; this.dataSource = dataSource; this.sql = sql; touch();
+        }
+        private void touch() {
+            lastAccessNanos = System.nanoTime();
         }
     }
 
@@ -650,8 +732,12 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     /** 某个 URI 对应的四个 Meter。 */
     private static final class UriMeters {
         private final Timer timer; private final DistributionSummary jdbcExecutions; private final DistributionSummary jdbcAffectedRows; private final DistributionSummary jdbcFetchedRows;
+        private volatile long lastAccessNanos;
         private UriMeters(Timer timer, DistributionSummary jdbcExecutions, DistributionSummary jdbcAffectedRows, DistributionSummary jdbcFetchedRows) {
-            this.timer = timer; this.jdbcExecutions = jdbcExecutions; this.jdbcAffectedRows = jdbcAffectedRows; this.jdbcFetchedRows = jdbcFetchedRows;
+            this.timer = timer; this.jdbcExecutions = jdbcExecutions; this.jdbcAffectedRows = jdbcAffectedRows; this.jdbcFetchedRows = jdbcFetchedRows; touch();
+        }
+        private void touch() {
+            lastAccessNanos = System.nanoTime();
         }
     }
 
