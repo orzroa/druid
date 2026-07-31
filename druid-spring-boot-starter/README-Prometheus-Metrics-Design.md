@@ -22,19 +22,9 @@
 
 ## 2. 当前状态
 
-当前 starter 已完成以下工作：
-
-- Druid 指标注册进已有 `MeterRegistry`，未注册 `/actuator/prometheus`
-  Servlet。
-- 当前仍保留 SQL 与 Web URI 的 19 个 `druid2prom` 兼容指标，并以 15 秒周期
-  刷新内存 Gauge；这是待删除的过渡实现，而非目标架构。
-
-当前仍存在两项关键问题：
-
-1. 采集仍通过 `DruidStatService.service("/sql.json")` 和
-   `service("/weburi.json")`；虽没有网络 I/O，仍有 JSON 编解码开销，并复用
-   了管理页面排序、分页的行为。
-2. 已取消 `reset-all` 后，累计平均值和历史 max 不能体现近期状态。
+当前 starter 已直接将 SQL 与 Web 事件注册进已有的 `MeterRegistry`，不注册
+`/actuator/prometheus` Servlet，也不再读取 Druid 的 JSON 管理端点或启动周期刷新线程。
+当前仅提供本文定义的 7 个 Meter；近期 max 由 Micrometer 的滑动统计窗口计算。
 
 ## 3. 目标架构
 
@@ -245,6 +235,7 @@ API，但会面临 Filter 顺序、异常路径、异步请求和与 Druid StatF
 - 超限后的策略：拒绝新序列、聚合到 `other`，按 TTL 删除，或按 LRU 淘汰；本实现
   使用近似 LRU，以保留当前活跃的序列且不引入额外的聚合标签或 dropped 指标。正常命中
   只更新时间戳，序列创建或淘汰时才加锁，因此并发下访问顺序和上限可能短暂存在轻微偏差。
+  新序列会先完成 Meter 注册，再淘汰旧序列，避免注册失败损失已有观测。
 - SQL 标签不使用原文：D4 已确认，严格沿用 druid2prom，取 Druid 最终统计 SQL
   文本的 UTF-8 MD5，输出 32 位小写十六进制。每个新 hash 首次出现时，将
   `hash -> SQL` 写入可配置的本地映射目录；每个 SQL 一个文件，文件名就是 32 位
@@ -257,8 +248,8 @@ API，但会面临 Filter 顺序、异常路径、异步请求和与 Druid StatF
   的 404，继续使用 Druid 现有的 `<contextPath>error_404` 聚合键；不改为
   `NOT_FOUND`，也不按原始随机路径创建序列。
 - D6 已确认：SQL 指标增加稳定的 `datasource` 标签；URI 指标不增加该标签。
-  数据源标签优先取显式配置或稳定的 Spring Bean 名称，不使用 JDBC URL、用户名
-  或对象 identity；SQL 与 URI 分别计算各自的 Meter 上限。
+  数据源标签优先从 JDBC URL 解析库名，其次取 Druid 名称或稳定的 Spring Bean 名称；
+  SQL 与 URI 分别计算各自的 Meter 上限。
 - D5 已确认：URI 模板优先级为“应用自定义 URI 模板 SPI → Spring MVC 已匹配模板
   → Druid 原始 URI”；非 Spring MVC 且无自定义模板时允许回退原始 URI。模板标签
   去掉 context path；无稳定数据源名称时使用固定值 `unknown`。
@@ -266,14 +257,13 @@ API，但会面临 Filter 顺序、异常路径、异步请求和与 Druid StatF
   并从 MeterRegistry 注销其 Meter。上限调整会在后续事件访问时生效。
 - SQL identity 进入 PENDING 状态时即占用 `max-sql-identities` 配额；它不能借由
   等待异步映射写盘而绕过上限。
-- 禁用采集时停止后续事件记录；不删除或重建任何已有 Meter，尤其不影响业务已有
-  Meter。
+- 禁用采集时停止后续事件记录；已有 Meter 保留，直到后续 LRU 淘汰需要释放容量。
 
 ## 9. 配置草案
 
-配置名尚未定稿，拟提供以下配置；均有默认值。Prometheus 注册默认关闭，需显式将
-`spring.datasource.druid.prometheus.enabled` 设为 `true`；其余配置在启用后使用以下
-默认值。默认在启动时加载，接入刷新 SPI 后支持运行时替换配置快照：
+配置均有默认值。Prometheus 指标默认启用；可通过
+`spring.datasource.druid.prometheus.enabled=false` 关闭。默认在启动时加载，接入刷新
+SPI 后支持运行时替换配置快照：
 
 ```properties
 spring.datasource.druid.prometheus.enabled=true
@@ -301,7 +291,8 @@ Histogram 不提供配置项，按 D8 永久关闭。
 
 运行时需要替换配置时，应用可取得 starter 暴露的
 `DruidPrometheusMetricsRefresher` 并调用 `refresh(Prometheus)`；替换对事件路径
-原子生效，不删除或重建已有 Meter，`max-window` 仅作用于之后新建的 Meter。
+原子生效；identity 上限缩小时会在后续事件中按近似 LRU 淘汰已有 Meter，
+`max-window` 仅作用于之后新建的 Meter。
 `enabled`、`events.enabled`、两个 identity 上限、SQL 映射开关与目录、
 以及 URI context-path 开关，对后续事件立即生效；`max-window` 仅对新建 Meter
 生效；`sql-mapping.queue-size` 仅在映射写线程创建时读取，修改后需重启才能生效。

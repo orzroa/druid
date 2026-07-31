@@ -18,8 +18,12 @@ package com.alibaba.druid.spring.boot.autoconfigure.stat;
 import com.alibaba.druid.proxy.jdbc.DataSourceProxy;
 import com.alibaba.druid.spring.boot.autoconfigure.properties.DruidStatProperties;
 import io.micrometer.core.instrument.DistributionSummary;
+import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.config.MeterFilter;
+import io.micrometer.core.instrument.config.MeterFilterReply;
+import io.micrometer.core.instrument.distribution.DistributionStatisticConfig;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.After;
 import org.junit.Test;
@@ -44,6 +48,7 @@ import java.util.function.BooleanSupplier;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -447,6 +452,42 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
         assertEquals(1, registry.find("druid.uri.request.duration").meters().size());
         assertEquals(null, registry.find("druid.uri.request.duration").tag("uri", "/one").timer());
         assertNotNull(registry.find("druid.uri.request.duration").tag("uri", "/two").timer());
+    }
+
+    @Test
+    public void uriIdentityLimit_keepsExistingUriWhenNewMeterCreationFails() {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        DruidStatProperties.Prometheus config = defaultConfig(false);
+        config.getEvents().setMaxUriIdentities(1);
+        DruidPrometheusMetricsListener listener = newListener(config, registry, null);
+        listener.init();
+        listener.onWebRequest(request(null, ""), "/existing", 1L, 0, 0, 0, null);
+        Timer externalTimer = Timer.builder("druid.uri.request.duration").tag("uri", "/new").register(registry);
+
+        registry.config().meterFilter(new MeterFilter() {
+            @Override
+            public MeterFilterReply accept(Meter.Id id) {
+                return MeterFilterReply.NEUTRAL;
+            }
+
+            @Override
+            public Meter.Id map(Meter.Id id) {
+                if ("druid.uri.jdbc.executions".equals(id.getName())) {
+                    throw new IllegalStateException("test registration failure");
+                }
+                return id;
+            }
+
+            @Override
+            public DistributionStatisticConfig configure(Meter.Id id, DistributionStatisticConfig config) {
+                return config;
+            }
+        });
+        listener.onWebRequest(request(null, ""), "/new", 1L, 0, 0, 0, null);
+
+        assertEquals(2, registry.find("druid.uri.request.duration").meters().size());
+        assertNotNull(registry.find("druid.uri.request.duration").tag("uri", "/existing").timer());
+        assertSame(externalTimer, registry.find("druid.uri.request.duration").tag("uri", "/new").timer());
     }
 
     // ==================== 配置热刷新 ====================

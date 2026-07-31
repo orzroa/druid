@@ -92,6 +92,8 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     private final ConcurrentMap<String, SqlState> sqlStates = new ConcurrentHashMap<String, SqlState>();
     /** 以 URI 模板为 key 缓存的 URI 指标 Meter。 */
     private final ConcurrentMap<String, UriMeters> uriMeters = new ConcurrentHashMap<String, UriMeters>();
+    /** 仅记录由本 Listener 注册的 Meter，防止淘汰或失败回收误删其他生产者的同名 Meter。 */
+    private final ConcurrentMap<Meter.Id, Meter> ownedMeters = new ConcurrentHashMap<Meter.Id, Meter>();
     /** 仅序列注册/淘汰时使用，正常命中路径不获取此锁。 */
     private final Object sqlMeterLock = new Object();
     /** 仅序列注册/淘汰时使用，正常命中路径不获取此锁。 */
@@ -283,13 +285,13 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
                 trimSqlStates(maxSqlIdentities());
                 return current;
             }
-            trimSqlStates(maxSqlIdentities() - 1);
             SqlState candidate = new SqlState(hash, dataSourceName, sql);
             try {
                 candidate.meters = createSqlMeters(candidate.hash, candidate.dataSource);
             } catch (RuntimeException e) {
                 return null;
             }
+            trimSqlStates(maxSqlIdentities() - 1);
             sqlStates.put(key, candidate);
             submitMapping(candidate);
             return candidate;
@@ -311,12 +313,12 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
                 trimUriMeters(maxUriIdentities());
                 return meters;
             }
-            trimUriMeters(maxUriIdentities() - 1);
             try {
                 meters = createUriMeters(template);
             } catch (RuntimeException e) {
                 return null;
             }
+            trimUriMeters(maxUriIdentities() - 1);
             uriMeters.put(template, meters);
             return meters;
         }
@@ -369,15 +371,15 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         DistributionSummary affected = null;
         DistributionSummary fetched = null;
         try {
-            timer = Timer.builder("druid.sql.execution.duration")
+            timer = registerTimer(Timer.builder("druid.sql.execution.duration")
                     .tags(tags).distributionStatisticExpiry(expiry)
-                    .distributionStatisticBufferLength(2).register(meterRegistry);
-            affected = DistributionSummary.builder("druid.sql.affected.rows")
+                    .distributionStatisticBufferLength(2), "druid.sql.execution.duration", tags);
+            affected = registerSummary(DistributionSummary.builder("druid.sql.affected.rows")
                     .tags(tags).distributionStatisticExpiry(expiry)
-                    .distributionStatisticBufferLength(2).register(meterRegistry);
-            fetched = DistributionSummary.builder("druid.sql.fetched.rows")
+                    .distributionStatisticBufferLength(2), "druid.sql.affected.rows", tags);
+            fetched = registerSummary(DistributionSummary.builder("druid.sql.fetched.rows")
                     .tags(tags).distributionStatisticExpiry(expiry)
-                    .distributionStatisticBufferLength(2).register(meterRegistry);
+                    .distributionStatisticBufferLength(2), "druid.sql.fetched.rows", tags);
             return new SqlMeters(timer, affected, fetched);
         } catch (RuntimeException e) {
             removeMeter(timer);
@@ -405,18 +407,18 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         DistributionSummary affectedRows = null;
         DistributionSummary fetchedRows = null;
         try {
-            timer = Timer.builder("druid.uri.request.duration").tags(tags)
-                    .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2)
-                    .register(meterRegistry);
-            executions = DistributionSummary.builder("druid.uri.jdbc.executions").tags(tags)
-                    .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2)
-                    .register(meterRegistry);
-            affectedRows = DistributionSummary.builder("druid.uri.jdbc.affected.rows").tags(tags)
-                    .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2)
-                    .register(meterRegistry);
-            fetchedRows = DistributionSummary.builder("druid.uri.jdbc.fetched.rows").tags(tags)
-                    .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2)
-                    .register(meterRegistry);
+            timer = registerTimer(Timer.builder("druid.uri.request.duration").tags(tags)
+                    .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2),
+                    "druid.uri.request.duration", tags);
+            executions = registerSummary(DistributionSummary.builder("druid.uri.jdbc.executions").tags(tags)
+                    .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2),
+                    "druid.uri.jdbc.executions", tags);
+            affectedRows = registerSummary(DistributionSummary.builder("druid.uri.jdbc.affected.rows").tags(tags)
+                    .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2),
+                    "druid.uri.jdbc.affected.rows", tags);
+            fetchedRows = registerSummary(DistributionSummary.builder("druid.uri.jdbc.fetched.rows").tags(tags)
+                    .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2),
+                    "druid.uri.jdbc.fetched.rows", tags);
             return new UriMeters(timer, executions, affectedRows, fetchedRows);
         } catch (RuntimeException e) {
             removeMeter(timer);
@@ -661,6 +663,24 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         return oldest;
     }
 
+    private Timer registerTimer(Timer.Builder builder, String name, Tags tags) {
+        boolean existed = meterRegistry.find(name).tags(tags).meter() != null;
+        Timer meter = builder.register(meterRegistry);
+        if (!existed) {
+            ownedMeters.putIfAbsent(meter.getId(), meter);
+        }
+        return meter;
+    }
+
+    private DistributionSummary registerSummary(DistributionSummary.Builder builder, String name, Tags tags) {
+        boolean existed = meterRegistry.find(name).tags(tags).meter() != null;
+        DistributionSummary meter = builder.register(meterRegistry);
+        if (!existed) {
+            ownedMeters.putIfAbsent(meter.getId(), meter);
+        }
+        return meter;
+    }
+
     private void removeSqlMeters(SqlMeters meters) {
         removeMeter(meters.timer);
         removeMeter(meters.affectedRows);
@@ -674,9 +694,9 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         removeMeter(meters.jdbcFetchedRows);
     }
 
-    /** 创建失败时尽力回收已注册的 Meter，回收异常不覆盖原始注册异常。 */
+    /** 仅回收本 Listener 注册的 Meter，回收异常不覆盖原始注册异常。 */
     private void removeMeter(Meter meter) {
-        if (meter == null) {
+        if (meter == null || !ownedMeters.remove(meter.getId(), meter)) {
             return;
         }
         try {
