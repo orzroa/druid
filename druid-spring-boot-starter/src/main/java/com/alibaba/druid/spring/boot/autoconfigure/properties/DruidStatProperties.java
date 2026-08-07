@@ -190,6 +190,7 @@ public class DruidStatProperties {
             private int maxSqlIdentities = 1000;
             private int maxUriIdentities = 1000;
             private String maxWindow = "2m";
+            private Cleanup cleanup = new Cleanup();
 
             public boolean isEnabled() { return enabled; }
             public void setEnabled(boolean enabled) { this.enabled = enabled; }
@@ -199,6 +200,21 @@ public class DruidStatProperties {
             public void setMaxUriIdentities(int maxUriIdentities) { this.maxUriIdentities = maxUriIdentities; }
             public String getMaxWindow() { return maxWindow; }
             public void setMaxWindow(String maxWindow) { this.maxWindow = maxWindow; }
+            public Cleanup getCleanup() { return cleanup; }
+            public void setCleanup(Cleanup cleanup) { this.cleanup = cleanup; }
+
+            /**
+             * 1.5 期高基数明细 Meter 定期清理配置。清理是否启用由 {@link Cleanup#intervalHours}
+             * 决定（n&lt;=0 关闭，n&gt;=24 退化为每日 0 点清理一次，0&lt;n&lt;24 每 n 小时清理一次）。
+             * 使用系统默认时区判断业务日期与小时边界。
+             */
+            public static class Cleanup {
+                /** 清理周期（整数小时）。n&lt;=0 关闭；n&gt;=24 每日清理一次；否则每 n 小时清理一次。 */
+                private int intervalHours = 6;
+
+                public int getIntervalHours() { return intervalHours; }
+                public void setIntervalHours(int intervalHours) { this.intervalHours = intervalHours; }
+            }
         }
 
         public static class UriTemplate {

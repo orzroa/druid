@@ -40,6 +40,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -69,7 +70,7 @@ import static org.mockito.Mockito.withSettings;
  *     <li>并发：队列满时丢弃且不阻塞业务事件路径。</li>
  * </ul>
  *
- * <p>本测试不修改任何生产代码，仅通过公共 API 与 Micrometer 检索断言行为。
+ * <p>本测试通过公共 API、同包纯解析函数与 Micrometer 检索断言行为。
  */
 public class DruidPrometheusMetricsListenerComprehensiveTest {
     private static final String MVC_PATTERN_KEY =
@@ -126,6 +127,27 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
         String c = DruidPrometheusMetricsListener.calculateSqlMd5("select 2");
         assertEquals(a, b);
         assertFalse(a.equals(c));
+    }
+
+    // ==================== max-window 解析 ====================
+
+    @Test
+    public void parseMaxWindow_supportsMillisecondsSecondsAndMinutes() {
+        assertEquals(Duration.ofMillis(10), DruidPrometheusMetricsListener.parseMaxWindow("10ms"));
+        assertEquals(Duration.ofSeconds(10), DruidPrometheusMetricsListener.parseMaxWindow("10s"));
+        assertEquals(Duration.ofMinutes(10), DruidPrometheusMetricsListener.parseMaxWindow("10m"));
+        assertEquals(Duration.ofMillis(10), DruidPrometheusMetricsListener.parseMaxWindow(" 10MS "));
+    }
+
+    @Test
+    public void parseMaxWindow_invalidValuesFallBackToTwoMinutes() {
+        Duration fallback = Duration.ofMinutes(2);
+        assertEquals(fallback, DruidPrometheusMetricsListener.parseMaxWindow(null));
+        assertEquals(fallback, DruidPrometheusMetricsListener.parseMaxWindow(""));
+        assertEquals(fallback, DruidPrometheusMetricsListener.parseMaxWindow("10"));
+        assertEquals(fallback, DruidPrometheusMetricsListener.parseMaxWindow("0ms"));
+        assertEquals(fallback, DruidPrometheusMetricsListener.parseMaxWindow("-1s"));
+        assertEquals(fallback, DruidPrometheusMetricsListener.parseMaxWindow(Long.MAX_VALUE + "m"));
     }
 
     // ==================== SQL 事件 ====================

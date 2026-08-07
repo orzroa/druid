@@ -44,13 +44,24 @@ import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * 将 Druid 原生的统计事件（SQL 执行、Web 请求）记录到应用已有的 {@link MeterRegistry} 中，
@@ -77,6 +88,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     /** Spring MVC 在请求属性中存放“最佳匹配路径模板”的 key，例如 {@code /users/{id}}。 */
     private static final String SPRING_MVC_PATTERN_ATTRIBUTE =
             "org.springframework.web.servlet.HandlerMapping.bestMatchingPattern";
+    private static final Duration DEFAULT_MAX_WINDOW = Duration.ofMinutes(2);
 
     /** 当前的 Prometheus 配置快照（运行时可被 {@link #refresh} 原子替换）。 */
     private volatile DruidStatProperties.Prometheus config;
@@ -109,6 +121,30 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     /** 容器工厂（用于反查 DataSource Bean 名）；非 ListableBeanFactory 时为 null。 */
     private volatile ListableBeanFactory beanFactory;
 
+    // ===== 1.5 期：高基数明细 Meter 定期清理 =====
+    /** 时间源（生产用系统时钟，测试可注入固定时钟以验证边界场景）。 */
+    private final Clock clock;
+    /** 清理专用 logger（独立于结构化事件 logger）。 */
+    private static final java.util.logging.Logger CLEANUP_LOG =
+            java.util.logging.Logger.getLogger("druid.prometheus.cleanup");
+    /** 尚未收到首条有效事件、未建立清理基准时间。 */
+    private static final long CLEANUP_BASELINE_UNINITIALIZED = Long.MIN_VALUE;
+    /** 清理关闭时使用的截止时间，保证快路径只需一次整数比较。 */
+    private static final long CLEANUP_DISABLED = Long.MAX_VALUE;
+    /** 清理日志时间格式。 */
+    private static final DateTimeFormatter CLEANUP_TIME_FORMATTER = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
+    /** 上次清理基准时间；首条有效事件只初始化该值，不执行清理。 */
+    private volatile long lastDetailMeterCleanupAtMillis = CLEANUP_BASELINE_UNINITIALIZED;
+    /** 当前清理周期及下一个固定清理点的不可变快照；单次 volatile 写保证动态刷新原子生效。 */
+    private volatile CleanupSchedule cleanupSchedule =
+            new CleanupSchedule(0, CLEANUP_BASELINE_UNINITIALIZED);
+    /** 清理与一期 Meter 生命周期共用一把读写锁：清理持写锁，普通事件持读锁。 */
+    private final ReentrantReadWriteLock cleanupLock = new ReentrantReadWriteLock();
+    /** 单条 Meter 注销失败 WARN 限频：每秒最多一条。 */
+    private final AtomicLong lastRemovalWarnMs = new AtomicLong(0L);
+    /** 注销失败的 Meter 句柄，下个清理周期重试。与 identity/LRU 解耦，避免拖累正常事件路径。 */
+    private final ConcurrentMap<Meter.Id, Meter> failedRemovals = new ConcurrentHashMap<Meter.Id, Meter>();
+
     /**
      * 构造器。由 Spring 自动注入配置与两个 Provider。
      *
@@ -119,9 +155,23 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     public DruidPrometheusMetricsListener(DruidStatProperties.Prometheus config,
                                            ObjectProvider<MeterRegistry> meterRegistryProvider,
                                            ObjectProvider<DruidUriTemplateResolver> uriTemplateResolverProvider) {
+        this(config, meterRegistryProvider, uriTemplateResolverProvider, Clock.systemDefaultZone());
+    }
+
+    /**
+     * 测试专用构造器，可注入 {@link Clock} 以验证时间边界场景。生产代码使用
+     * {@link #DruidPrometheusMetricsListener(DruidStatProperties.Prometheus, ObjectProvider, ObjectProvider)}。
+     *
+     * @param clock                       时间源
+     */
+    DruidPrometheusMetricsListener(DruidStatProperties.Prometheus config,
+                                    ObjectProvider<MeterRegistry> meterRegistryProvider,
+                                    ObjectProvider<DruidUriTemplateResolver> uriTemplateResolverProvider,
+                                    Clock clock) {
         this.config = config;
         this.meterRegistryProvider = meterRegistryProvider;
         this.uriTemplateResolverProvider = uriTemplateResolverProvider;
+        this.clock = clock;
     }
 
     /**
@@ -134,6 +184,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         if (meterRegistry == null) {
             return;
         }
+        resolveCleanupInterval();
         int queueSize = Math.max(1, config.getSqlMapping().getQueueSize());
         // 单线程 + 有界队列 + 拒绝即抛 AbortPolicy，保证落盘不会无限堆积、也不会阻塞事件线程
         mappingExecutor = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
@@ -142,6 +193,31 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         // 向 Druid 注册自己，开始接收 SQL / Web 事件
         StatFilterContext.getInstance().addEventListener(this);
         WebStatEventContext.addListener(this);
+    }
+
+    /**
+     * 读取清理周期配置。n<=0 时关闭清理并输出日志。
+     */
+    private void resolveCleanupInterval() {
+        int n = config.getEvents().getCleanup().getIntervalHours();
+        int previousN = cleanupSchedule.intervalHours;
+        if (n <= 0) {
+            if (previousN > 0) {
+                CLEANUP_LOG.warning("cleanup interval-hours=" + n + " <= 0, cleanup disabled");
+            } else {
+                CLEANUP_LOG.info("cleanup interval-hours=" + n + " <= 0, cleanup disabled on startup");
+            }
+        }
+        long nextCleanupAt;
+        if (n <= 0) {
+            nextCleanupAt = CLEANUP_DISABLED;
+        } else {
+            long last = lastDetailMeterCleanupAtMillis;
+            nextCleanupAt = last == CLEANUP_BASELINE_UNINITIALIZED
+                    ? CLEANUP_BASELINE_UNINITIALIZED
+                    : nextCleanupBoundaryMillis(last, n);
+        }
+        cleanupSchedule = new CleanupSchedule(n, nextCleanupAt);
     }
 
     /**
@@ -167,7 +243,14 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     @Override
     public void refresh(DruidStatProperties.Prometheus config) {
         if (config != null) {
-            this.config = config;
+            cleanupLock.writeLock().lock();
+            try {
+                this.config = config;
+                // 配置刷新是低频操作；与清理串行更新周期和下次截止时间，避免混用新旧配置。
+                resolveCleanupInterval();
+            } finally {
+                cleanupLock.writeLock().unlock();
+            }
         }
     }
 
@@ -189,9 +272,15 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         if (!isEnabled() || error != null || sql == null || sql.length() == 0) {
             return;
         }
-        SqlState state = sqlState(sql, dataSource);
-        if (state != null && state.meters != null) {
-            state.meters.timer.record(durationNanos, TimeUnit.NANOSECONDS);
+        maybeCleanup("sql", dataSource);
+        cleanupLock.readLock().lock();
+        try {
+            SqlState state = sqlState(sql, dataSource);
+            if (state != null && state.meters != null) {
+                state.meters.timer.record(durationNanos, TimeUnit.NANOSECONDS);
+            }
+        } finally {
+            cleanupLock.readLock().unlock();
         }
     }
 
@@ -204,9 +293,15 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         if (!isEnabled() || sql == null || sql.length() == 0) {
             return;
         }
-        SqlState state = sqlState(sql, dataSource);
-        if (updateCount >= 0 && state != null && state.meters != null) {
-            state.meters.affectedRows.record(updateCount);
+        maybeCleanup("sql", dataSource);
+        cleanupLock.readLock().lock();
+        try {
+            SqlState state = sqlState(sql, dataSource);
+            if (updateCount >= 0 && state != null && state.meters != null) {
+                state.meters.affectedRows.record(updateCount);
+            }
+        } finally {
+            cleanupLock.readLock().unlock();
         }
     }
 
@@ -219,9 +314,15 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         if (!isEnabled() || sql == null || sql.length() == 0) {
             return;
         }
-        SqlState state = sqlState(sql, dataSource);
-        if (state != null && state.meters != null) {
-            state.meters.fetchedRows.record(fetchRowCount);
+        maybeCleanup("sql", dataSource);
+        cleanupLock.readLock().lock();
+        try {
+            SqlState state = sqlState(sql, dataSource);
+            if (state != null && state.meters != null) {
+                state.meters.fetchedRows.record(fetchRowCount);
+            }
+        } finally {
+            cleanupLock.readLock().unlock();
         }
     }
 
@@ -240,14 +341,26 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         if (template == null || template.length() == 0) {
             return;
         }
-        UriMeters meters = uriMeters(template);
-        if (meters == null) {
-            return;
+        maybeCleanup("uri", template);
+        cleanupLock.readLock().lock();
+        try {
+            UriMeters meters = uriMeters(template);
+            if (meters == null) {
+                return;
+            }
+            meters.timer.record(durationNanos, TimeUnit.NANOSECONDS);
+            if (jdbcExecuteCount >= 0) meters.jdbcExecutions.record(jdbcExecuteCount);
+            if (jdbcUpdateCount >= 0) meters.jdbcAffectedRows.record(jdbcUpdateCount);
+            if (jdbcFetchRowCount >= 0) meters.jdbcFetchedRows.record(jdbcFetchRowCount);
+        } finally {
+            cleanupLock.readLock().unlock();
         }
-        meters.timer.record(durationNanos, TimeUnit.NANOSECONDS);
-        if (jdbcExecuteCount >= 0) meters.jdbcExecutions.record(jdbcExecuteCount);
-        if (jdbcUpdateCount >= 0) meters.jdbcAffectedRows.record(jdbcUpdateCount);
-        if (jdbcFetchRowCount >= 0) meters.jdbcFetchedRows.record(jdbcFetchRowCount);
+    }
+
+    /** URI 模板哈希前缀（前 8 位），用于清理日志，不含完整 URI 明细。 */
+    private static String uriHashPrefix(String template) {
+        String hash = calculateSqlMd5(template);
+        return hash.length() >= 8 ? hash.substring(0, 8) : hash;
     }
 
     /**
@@ -255,6 +368,205 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
      */
     private boolean isEnabled() {
         return meterRegistry != null && config.isEnabled() && config.getEvents().isEnabled();
+    }
+
+    /**
+     * 1.5 期清理判断入口。按文档判定规则求值，必要时升级为写锁执行清理。
+     * 清理点为按业务时区当日 00:00 起每 n 整点固定（n=3 时为 0/3/6/9...），与上次清理时刻无关。
+     *
+     * @param triggerType   触发事件类型（"sql"/"uri"），仅用于日志
+     * @param triggerSource 原始触发来源（DataSourceProxy 或 URI 模板）；直接传已有引用，避免事件路径分配包装对象
+     */
+    private void maybeCleanup(String triggerType, Object triggerSource) {
+        CleanupSchedule schedule = cleanupSchedule;
+        int n = schedule.intervalHours;
+        if (n <= 0) {
+            return;
+        }
+        long nowMillis = clock.millis();
+        long nextCleanupAt = schedule.nextCleanupAtMillis;
+        if (nextCleanupAt != CLEANUP_BASELINE_UNINITIALIZED && nowMillis < nextCleanupAt) {
+            return;
+        }
+
+        CleanupResult result = null;
+        // 首条事件初始化以及真正清理都是低频路径；用写锁保证只初始化/清理一次。
+        cleanupLock.writeLock().lock();
+        try {
+            schedule = cleanupSchedule;
+            int currentN = schedule.intervalHours;
+            if (currentN <= 0) {
+                return;
+            }
+            nowMillis = clock.millis();
+            nextCleanupAt = schedule.nextCleanupAtMillis;
+            if (nextCleanupAt == CLEANUP_BASELINE_UNINITIALIZED) {
+                lastDetailMeterCleanupAtMillis = nowMillis;
+                cleanupSchedule = new CleanupSchedule(currentN, nextCleanupBoundaryMillis(nowMillis, currentN));
+                return;
+            }
+            if (nowMillis < nextCleanupAt) {
+                return;
+            }
+            String reason = cleanupReason(lastDetailMeterCleanupAtMillis, nowMillis);
+            result = performCleanup(nowMillis, currentN, reason);
+            lastDetailMeterCleanupAtMillis = nowMillis;
+            cleanupSchedule = new CleanupSchedule(currentN, nextCleanupBoundaryMillis(nowMillis, currentN));
+        } finally {
+            cleanupLock.writeLock().unlock();
+        }
+        // 来源解析可能扫描 Spring Bean；日志格式化也可能较慢，必须在写锁外完成。
+        try {
+            logCleanup(result, triggerType, triggerSource);
+        } catch (RuntimeException ignored) {
+            // 清理日志及自定义日志 Handler 的异常不能影响指标事件主路径。
+        }
+    }
+
+    /** 根据系统默认时区计算 reference 所在固定区间之后的下一个清理点。仅在低频路径调用。 */
+    private long nextCleanupBoundaryMillis(long referenceMillis, int n) {
+        ZoneId zone = clock.getZone();
+        ZonedDateTime reference = Instant.ofEpochMilli(referenceMillis).atZone(zone);
+        LocalDate date = reference.toLocalDate();
+        if (n >= 24) {
+            return date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli();
+        }
+        int nextHour = ((reference.getHour() / n) + 1) * n;
+        if (nextHour >= 24) {
+            return date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli();
+        }
+        return date.atTime(nextHour, 0).atZone(zone).toInstant().toEpochMilli();
+    }
+
+    /** 清理原因只在确认跨过清理点后计算。 */
+    private String cleanupReason(long lastMillis, long nowMillis) {
+        ZoneId zone = clock.getZone();
+        LocalDate lastDate = Instant.ofEpochMilli(lastMillis).atZone(zone).toLocalDate();
+        LocalDate nowDate = Instant.ofEpochMilli(nowMillis).atZone(zone).toLocalDate();
+        return lastDate.equals(nowDate) ? "new-interval" : "cross-day";
+    }
+
+    /**
+     * 执行实际的清理：注销 Starter 持有的一期 SQL/URI 明细 Meter，清空 identity/LRU/句柄。
+     * 调用方持有写锁。完成后由调用方推进清理基准和下一个固定清理点。
+     * 始终移除 identity/LRU 状态；注销失败的单个 Meter 句柄存入 {@link #failedRemovals}，下周期重试。
+     */
+    private CleanupResult performCleanup(long nowMillis, int n, String reason) {
+        ZoneId zone = clock.getZone();
+        ZonedDateTime nowZdt = Instant.ofEpochMilli(nowMillis).atZone(zone);
+        int h = nowZdt.getHour();
+        int slot = (n < 24) ? (h / n) : 0;
+        int boundaryHour = slot * n;
+        long startNs = System.nanoTime();
+        int sqlBefore = sqlStates.size();
+        int uriBefore = uriMeters.size();
+
+        // 先重试上一周期注销失败的 Meter
+        int retrySuccess = 0, retryFailed = 0;
+        if (!failedRemovals.isEmpty()) {
+            Iterator<Map.Entry<Meter.Id, Meter>> retryIt = failedRemovals.entrySet().iterator();
+            while (retryIt.hasNext()) {
+                Map.Entry<Meter.Id, Meter> entry = retryIt.next();
+                try {
+                    meterRegistry.remove(entry.getValue());
+                    retryIt.remove();
+                    retrySuccess++;
+                } catch (RuntimeException e) {
+                    retryFailed++;
+                    // 保留在 failedRemovals 供下次重试
+                }
+            }
+        }
+
+        // 1. 注销 SQL Meter；始终移除 SqlState，失败 Meter 存入 failedRemovals
+        int sqlSuccess = 0, sqlFailed = 0;
+        for (SqlState state : sqlStates.values()) {
+            if (state.meters == null) continue;
+            if (removeMeterOrDefer(state.meters.timer)) sqlSuccess++; else sqlFailed++;
+            if (removeMeterOrDefer(state.meters.affectedRows)) sqlSuccess++; else sqlFailed++;
+            if (removeMeterOrDefer(state.meters.fetchedRows)) sqlSuccess++; else sqlFailed++;
+        }
+        sqlStates.clear();
+
+        // 2. 注销 URI Meter；同样始终移除
+        int uriSuccess = 0, uriFailed = 0;
+        for (UriMeters meters : uriMeters.values()) {
+            if (removeMeterOrDefer(meters.timer)) uriSuccess++; else uriFailed++;
+            if (removeMeterOrDefer(meters.jdbcExecutions)) uriSuccess++; else uriFailed++;
+            if (removeMeterOrDefer(meters.jdbcAffectedRows)) uriSuccess++; else uriFailed++;
+            if (removeMeterOrDefer(meters.jdbcFetchedRows)) uriSuccess++; else uriFailed++;
+        }
+        uriMeters.clear();
+
+        long finishedMillis = clock.millis();
+        long elapsedMs = (System.nanoTime() - startNs) / 1_000_000L;
+        return new CleanupResult(nowMillis, finishedMillis, elapsedMs, reason, n, slot, boundaryHour,
+                sqlBefore, uriBefore, sqlSuccess, sqlFailed, uriSuccess, uriFailed, retrySuccess, retryFailed);
+    }
+
+    /** 在清理写锁外解析触发来源并输出业务日志。 */
+    private void logCleanup(CleanupResult result, String triggerType, Object rawTriggerSource) {
+        String triggerSource = "unknown";
+        try {
+            if ("sql".equals(triggerType) && rawTriggerSource instanceof DataSourceProxy) {
+                triggerSource = dataSourceName((DataSourceProxy) rawTriggerSource);
+            } else if ("uri".equals(triggerType) && rawTriggerSource instanceof String) {
+                triggerSource = uriHashPrefix((String) rawTriggerSource);
+            }
+        } catch (RuntimeException e) {
+            // 清理日志的附加信息绝不能影响指标事件主路径。
+            CLEANUP_LOG.warning("failed to resolve cleanup trigger source: " + e.getMessage());
+        }
+
+        ZoneId zone = clock.getZone();
+        ZonedDateTime started = Instant.ofEpochMilli(result.startedMillis).atZone(zone);
+        ZonedDateTime finished = Instant.ofEpochMilli(result.finishedMillis).atZone(zone);
+        CLEANUP_LOG.info("druid detail meter cleanup: date=" + started.toLocalDate()
+                + " zone=" + zone.getId()
+                + " reason=" + result.reason
+                + " boundary=" + String.format("%02d:00", result.boundaryHour)
+                + " slot=" + result.slot
+                + " interval-hours=" + result.intervalHours
+                + " started=" + started.format(CLEANUP_TIME_FORMATTER)
+                + " finished=" + finished.format(CLEANUP_TIME_FORMATTER)
+                + " elapsedMs=" + result.elapsedMs
+                + " sqlBefore=" + result.sqlBefore
+                + " uriBefore=" + result.uriBefore
+                + " sqlSuccess=" + result.sqlSuccess
+                + " sqlFailed=" + result.sqlFailed
+                + " uriSuccess=" + result.uriSuccess
+                + " uriFailed=" + result.uriFailed
+                + " retrySuccess=" + result.retrySuccess
+                + " retryFailed=" + result.retryFailed
+                + " triggerType=" + triggerType
+                + " triggerSource=" + triggerSource);
+    }
+
+    /**
+     * 注销单个 Meter；成功返回 true。失败时把句柄存入 {@link #failedRemovals} 供下周期重试，返回 false。
+     * 仅当 Meter 属于本 listener（即 {@link #ownedMeters} 中存在对应记录）时才调用 registry.remove；
+     * 外部组件预注册的同 ID Meter 不删除，仅清除本地 identity 引用（由调用方负责）。
+     */
+    private boolean removeMeterOrDefer(Meter meter) {
+        if (meter == null) return true;
+        // 只有 ownedMeters.remove 成功才说明这个 Meter 归本 listener 管
+        if (!ownedMeters.remove(meter.getId(), meter)) {
+            // 不属于本 listener（外部预注册），不调用 registry.remove
+            return true;
+        }
+        try {
+            meterRegistry.remove(meter);
+            return true;
+        } catch (RuntimeException e) {
+            failedRemovals.put(meter.getId(), meter);
+            long now = System.currentTimeMillis();
+            long last = lastRemovalWarnMs.get();
+            if (now - last >= 1000L && lastRemovalWarnMs.compareAndSet(last, now)) {
+                CLEANUP_LOG.warning("failed to remove meter " + meter.getId()
+                        + ", deferred to next cleanup cycle: " + e.getMessage());
+            }
+            return false;
+        }
     }
 
     /**
@@ -278,6 +590,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             trimSqlStatesIfNecessary();
             return current;
         }
+        // 调用方已持有 cleanupLock 读锁，防止与清理写锁并发
         synchronized (sqlMeterLock) {
             current = sqlStates.get(key);
             if (current != null) {
@@ -306,6 +619,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             trimUriMetersIfNecessary();
             return meters;
         }
+        // 调用方已持有 cleanupLock 读锁，防止与清理写锁并发
         synchronized (uriMeterLock) {
             meters = uriMeters.get(template);
             if (meters != null) {
@@ -575,20 +889,31 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
      * 该值只影响之后新建 Meter 的分布统计半衰期。
      */
     private Duration maxWindow() {
-        String value = config.getEvents().getMaxWindow();
+        return parseMaxWindow(config.getEvents().getMaxWindow());
+    }
+
+    /** 解析 max-window，供同包测试直接覆盖所有支持单位和非法输入。 */
+    static Duration parseMaxWindow(String value) {
         if (value == null || value.length() == 0) {
-            return Duration.ofMinutes(2);
+            return DEFAULT_MAX_WINDOW;
         }
         String trimmed = value.trim().toLowerCase();
         try {
             Duration window = null;
-            if (trimmed.endsWith("ms")) window = Duration.ofMillis(Long.parseLong(trimmed.substring(0, trimmed.length() - 2)));
-            if (trimmed.endsWith("s")) window = Duration.ofSeconds(Long.parseLong(trimmed.substring(0, trimmed.length() - 1)));
-            if (trimmed.endsWith("m")) window = Duration.ofMinutes(Long.parseLong(trimmed.substring(0, trimmed.length() - 1)));
+            if (trimmed.endsWith("ms")) {
+                window = Duration.ofMillis(Long.parseLong(trimmed.substring(0, trimmed.length() - 2)));
+            } else if (trimmed.endsWith("s")) {
+                window = Duration.ofSeconds(Long.parseLong(trimmed.substring(0, trimmed.length() - 1)));
+            } else if (trimmed.endsWith("m")) {
+                window = Duration.ofMinutes(Long.parseLong(trimmed.substring(0, trimmed.length() - 1)));
+            }
             if (window != null && !window.isNegative() && !window.isZero()) return window;
         } catch (NumberFormatException ignored) {
+            // 非数字配置回退默认值。
+        } catch (ArithmeticException ignored) {
+            // 超出 Duration 可表达范围时同样按非法配置处理。
         }
-        return Duration.ofMinutes(2);
+        return DEFAULT_MAX_WINDOW;
     }
 
     /** 当前 SQL 近似 LRU 容量，非法值仍保留一个身份以保证事件可被采集。 */
@@ -723,6 +1048,57 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             return out.toString();
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException(e);
+        }
+    }
+
+    /** 动态刷新时原子发布的清理调度快照。 */
+    private static final class CleanupSchedule {
+        private final int intervalHours;
+        private final long nextCleanupAtMillis;
+
+        private CleanupSchedule(int intervalHours, long nextCleanupAtMillis) {
+            this.intervalHours = intervalHours;
+            this.nextCleanupAtMillis = nextCleanupAtMillis;
+        }
+    }
+
+    /** 清理锁内生成的不可变统计快照，供锁外日志使用。每个清理周期只创建一个。 */
+    private static final class CleanupResult {
+        private final long startedMillis;
+        private final long finishedMillis;
+        private final long elapsedMs;
+        private final String reason;
+        private final int intervalHours;
+        private final int slot;
+        private final int boundaryHour;
+        private final int sqlBefore;
+        private final int uriBefore;
+        private final int sqlSuccess;
+        private final int sqlFailed;
+        private final int uriSuccess;
+        private final int uriFailed;
+        private final int retrySuccess;
+        private final int retryFailed;
+
+        private CleanupResult(long startedMillis, long finishedMillis, long elapsedMs, String reason,
+                              int intervalHours, int slot, int boundaryHour, int sqlBefore, int uriBefore,
+                              int sqlSuccess, int sqlFailed, int uriSuccess, int uriFailed,
+                              int retrySuccess, int retryFailed) {
+            this.startedMillis = startedMillis;
+            this.finishedMillis = finishedMillis;
+            this.elapsedMs = elapsedMs;
+            this.reason = reason;
+            this.intervalHours = intervalHours;
+            this.slot = slot;
+            this.boundaryHour = boundaryHour;
+            this.sqlBefore = sqlBefore;
+            this.uriBefore = uriBefore;
+            this.sqlSuccess = sqlSuccess;
+            this.sqlFailed = sqlFailed;
+            this.uriSuccess = uriSuccess;
+            this.uriFailed = uriFailed;
+            this.retrySuccess = retrySuccess;
+            this.retryFailed = retryFailed;
         }
     }
 

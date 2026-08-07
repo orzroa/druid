@@ -27,59 +27,57 @@
 1. 当 `n <= 0` 时，清理完全关闭，不执行任何清理判断或操作。
 2. 当 `n >= 24` 时，退化为每日清理一次：仅在跨入新自然日的首条事件触发清理，当日内不再清理。
 3. 当 `0 < n < 24` 时，清理生效。基准时间点为业务时区下的 `00:00:00`，此后每经过 `n` 小时为一个清理点：`00:00`、`n:00`、`2n:00`……，直到当日 `23:59:59` 为止；下一个自然日 `00:00` 重新开始计数。
-4. listener 在 JVM 内存中记录最近一次清理基准时间 `lastDetailMeterCleanupAt`，类型为 `Instant`，初始值为 `null`。进程刚启动时（`null`）由首条事件将其初始化为当前时间，不算清理，仅作为后续判定的基准。
-5. 每次事件到达时，将当前时间和 `lastDetailMeterCleanupAt` 按配置的业务时区转换为 `ZonedDateTime`，并取得各自的当地时间小时字段。
+4. listener 在 JVM 内存中以 epoch millis 记录最近一次清理基准时间 `lastDetailMeterCleanupAtMillis`，初始状态为未初始化。进程刚启动时由首条事件将其初始化为当前时间，不算清理；同时按系统默认时区预先算出下一个固定清理点 `nextDetailMeterCleanupAtMillis`。
+5. 普通事件到达时只调用 `Clock.millis()`，并与缓存的 `nextDetailMeterCleanupAtMillis` 做整数比较；未到截止时间直接返回，不创建 `Instant`、`ZonedDateTime`、lambda 或其他清理判断临时对象。时区换算仅发生在首次初始化、确认跨过清理点、动态刷新周期和输出清理日志等低频路径。
 6. 判定规则（必须按顺序求值）：
    - 若 `n <= 0`：不执行任何清理判断。
-   - 否则若 `n >= 24`：仅当 `lastDetailMeterCleanupAt != null` 且与当前时间属于不同自然日时，当前事件执行一次清理。`null`（进程刚启动）不触发立即清理，仅将 `lastDetailMeterCleanupAt` 初始化为当前时间。
+   - 若清理基准尚未初始化：进程刚启动，**不执行清理**，仅初始化当前基准及下一个固定清理点；事件按正常流程处理。
+   - 否则若当前 epoch millis 尚未到 `nextDetailMeterCleanupAtMillis`：不清理。
+   - 否则若 `n >= 24`：当前事件执行每日清理。
    - 否则（`0 < n < 24`）：设当前时间的当地小时字段为 `h`（`0 <= h < 24`），当前区间序号为 `slot = floor(h / n)`，对应的固定清理点小时为 `boundaryHour = slot * n`。
-     - 若 `lastDetailMeterCleanupAt == null`：进程刚启动，**不执行清理**，仅将 `lastDetailMeterCleanupAt` 初始化为当前时间，作为后续判定的基准；事件按正常流程处理。
-     - 否则若当前与 `lastDetailMeterCleanupAt` 属于不同自然日：立即清理。
-     - 否则设 `lastDetailMeterCleanupAt` 的当地小时字段为 `h0`，若 `floor(h / n) != floor(h0 / n)`（即当前已进入新的固定清理点）：立即清理。
-     - 否则：不清理。
+     - 当前事件立即清理；若最近基准时间与当前时间属于不同自然日，原因为 `cross-day`，否则为 `new-interval`。
+   - 清理完成后，以当前时间推进最近基准，并重新计算当前时间所在区间之后的下一个固定清理点；不会按错过的区间逐个补跑。
 7. 同一固定清理点内的后续事件不重复清理。
 
-因此“每 `n` 小时清理一次”的准确含义是：清理点是按业务时区当日 `00:00` 起每 `n` 整点固定的（`00:00`、`n:00`、`2n:00`……），与上次清理在区间内的具体时刻无关；事件到达时若发现当前已跨越上一个固定清理点但 `lastDetailMeterCleanupAt` 仍落在此清理点之前，即触发一次清理。某区间内一直没有 SQL/URI 事件时不会执行无意义清理；下一次事件到来时按规则补做一次，但不会按错过的区间逐个补跑。
+因此“每 `n` 小时清理一次”的准确含义是：清理点是按业务时区当日 `00:00` 起每 `n` 整点固定的（`00:00`、`n:00`、`2n:00`……），与上次清理在区间内的具体时刻无关；事件到达时若发现当前已到达缓存的下一个固定清理点，即触发一次清理。某区间内一直没有 SQL/URI 事件时不会执行无意义清理；下一次事件到来时按规则补做一次，但不会按错过的区间逐个补跑。
 
-`lastDetailMeterCleanupAt` 不持久化到磁盘或外部存储。应用重启后，旧 JVM 的 Meter 和引用已经随进程释放，新 JVM 的 `lastDetailMeterCleanupAt` 为 `null`，第一条事件按规则不立即清理，而是将 `lastDetailMeterCleanupAt` 初始化为当前时间作为基准，后续按规则判断；避免新进程刚启动就做无意义的空清理。每个应用实例独立维护该时间，不需要分布式锁。
+清理基准和下一个清理点不持久化到磁盘或外部存储。应用重启后，旧 JVM 的 Meter 和引用已经随进程释放，新 JVM 的清理基准为未初始化，第一条事件按规则不立即清理，而是建立当前基准和下一个固定清理点；避免新进程刚启动就做无意义的空清理。每个应用实例独立维护该时间，不需要分布式锁。
 
-## 时区语义
+## 时间语义
 
-日期/小时边界必须使用显式配置的 `ZoneId`，不得直接依赖容器或 JVM 默认时区。默认业务时区为 `Asia/Shanghai`：
+日期/小时边界使用 JVM 系统默认时区（`ZoneId.systemDefault()`），不提供单独的时区配置项。应用容器时区应与业务时区一致：
 
 ```properties
-# 用于判断业务日期与小时边界的时区
-spring.datasource.druid.prometheus.events.cleanup.zone=Asia/Shanghai
 # 清理周期（整数小时），默认 6，自当日 00:00 起每 n 小时清理一次
 # n<=0 时关闭清理；n>=24 时退化为每日 0 点清理一次
 spring.datasource.druid.prometheus.events.cleanup.interval-hours=6
 ```
 
-`events.cleanup.zone` 必须能被 `ZoneId.of(...)` 解析。启动配置非法时关闭清理并输出一次 `WARN`，不能影响 SQL/HTTP 主流程；Apollo 等动态刷新提供非法时区时拒绝新值、继续使用上一个有效时区并输出 `WARN`。`interval-hours` 默认值为 `6`；合法时区、`interval-hours` 动态即时生效。`interval-hours` 是清理功能开关，不再使用单独的 `cleanup.enabled`；清理实际执行还要求 `prometheus.enabled=true`、`events.enabled=true` 且当前持有合法时区。
+`interval-hours` 默认值为 `6`；动态即时生效。`interval-hours` 是清理功能开关，不再使用单独的 `cleanup.enabled`；清理实际执行还要求 `prometheus.enabled=true`、`events.enabled=true`。
 
-`interval-hours` 的动态刷新立即作用于下一条事件：若新值落入 `1..23`，按新 `n` 判断是否进入下一个区间；若新值落到 `<=0`，清理立即关闭，此后事件不再清理，也不重置 `lastDetailMeterCleanupAt`；若新值落到 `>=24`，退化为每日清理一次，跨日时立即清理，同日不清理。重新恢复到合法值后，下一条事件按已有 `lastDetailMeterCleanupAt` 与当前时间比较，跨日则立即清理一次；同日则按区间规则判断。
+`interval-hours` 的动态刷新立即作用于下一条事件：若新值落入 `1..23`，按新 `n` 和已有基准重新计算下一个固定清理点；若新值落到 `<=0`，清理立即关闭，此后事件不再清理，也不重置已有基准；若新值落到 `>=24`，按已有基准重新计算次日 0 点。重新恢复到合法值后，下一条事件与重新计算的固定清理点比较，已经跨过该点则立即清理一次。
 
-时区改变后不重写 `lastDetailMeterCleanupAt`。下一条事件分别用新时区转换“最后清理时间”和“当前时间”，按上述规则判断。`interval-hours` 从有效值变到 `<=0` 时清理立即关闭，此后事件不再清理，也不重置 `lastDetailMeterCleanupAt`；从 `<=0` 恢复到 `1..23` 或 `>=24` 后，下一条事件按规则判断，若 `lastDetailMeterCleanupAt == null` 则初始化为当前时间，不立即清理。
+`interval-hours` 从有效值变到 `<=0` 时清理立即关闭，此后事件不再清理，也不重置已有基准；从 `<=0` 恢复到 `1..23` 或 `>=24` 后，若基准已经建立则立即按新周期重算固定清理点，若基准尚未建立则由下一条事件初始化且不立即清理。
 
 ## 并发与清理流程
 
 清理判断、一期 Meter 生命周期和事件更新共用一把读写锁：
 
 1. 普通事件在查找、创建和更新一期明细 Meter 的整个临界段持有读锁。
-2. 事件初步发现需要清理时释放读锁并申请写锁；取得写锁后必须重新读取当前时间和 `lastDetailMeterCleanupAt`，防止多个并发事件重复清理。
+2. 事件初步发现当前时间已到缓存清理点时申请写锁；取得写锁后必须重新读取当前时间、当前周期和缓存清理点，防止动态刷新混用新旧配置或多个并发事件重复清理。
 3. 确认需要清理后，按 Starter 保存的注册句柄逐个从 `MeterRegistry` 注销一期 SQL/URI Meter；仅在确认注销成功后释放该 Meter 的所有权记录。
 4. 清空 SQL/URI identity 表、近似 LRU 元数据、已成功注销的注册句柄和 PENDING 状态，使旧对象不再被 Starter 强引用。注销失败的 Meter 仅保留准确注册句柄及所有权记录，供下一个清理周期重试，不保留其 identity/LRU 状态。
-5. 本地状态释放完成后，将当前 `Instant` 写入 `lastDetailMeterCleanupAt`，然后释放写锁。
+5. 本地状态释放完成后，更新最近清理基准和下一个固定清理点，然后释放写锁。
 6. 触发清理的当前事件重新进入一期正常记录流程，按需注册新 Meter，并成为新区间的第一条观测。
 
 清理期间到达的其他事件只等待写锁，不允许并发更新即将注销的 Meter。单个 Meter 注销失败时记录限频 `WARN` 并继续清理其他 Meter；无论 registry 注销结果如何，都必须记录本次清理完成时间，避免每条后续事件反复触发整批清理。注销成功的 Meter 释放本地引用；注销失败的 Meter 保留准确注册句柄及所有权记录，并在下一个清理周期重试。下一次事件仍按正常流程获取或注册对应 Meter。
 
-清理完成后输出一条组件业务日志，用于事后检查清理是否按预期执行以及清理了多少存量对象。日志至少包含以下字段：
+清理完成后输出一条组件业务日志，用于事后检查清理是否按预期执行以及清理了多少存量对象。触发来源解析、日志格式化和日志输出均在释放清理写锁后执行，避免延长事件阻塞时间。日志至少包含以下字段：
 
-- 业务日期（`yyyy-MM-dd`，按配置时区）
+- 业务日期（`yyyy-MM-dd`，按系统默认时区）
 - 时区 ID
 - 触发原因：`cross-day`（跨自然日）/ `new-interval`（同日进入新区间）
-- 固定清理点（`floor(h / n) * n:00`，按配置时区）
+- 固定清理点（`floor(h / n) * n:00`，按系统默认时区）
 - 区间序号（当日第几个 `n` 小时段，0-based）
 - `interval-hours` 当前值
 - 清理开始时间、完成时间（ISO 8601 含时区）
@@ -98,26 +96,26 @@ spring.datasource.druid.prometheus.events.cleanup.interval-hours=6
 
 ## 开关关系
 
-`events.cleanup.interval-hours` 是清理功能开关；实际执行还受 Prometheus 总开关、事件开关和合法时区约束，不改变一期其他配置语义：
+`events.cleanup.interval-hours` 是清理功能开关；实际执行还受 Prometheus 总开关和事件开关约束，不改变一期其他配置语义：
 
 - `prometheus.enabled=false` 时不处理 Prometheus 事件，也不触发清理；重新启用后的第一条事件按最近清理时间判断。
 - `events.enabled=false` 时不再处理一期明细 Meter 事件，也不触发清理；registry 中此前创建的明细 Meter 和 Starter 本地引用继续保留。重新启用后，下一条有效事件按最近清理时间判断是否需要清理。
 - `events.max-sql-identities`、`events.max-uri-identities` 和近似 LRU 继续有效；定期清理不是对容量上限的替代。
 - `events.max-window` 仍只控制一期 max 的统计窗口，不控制清理周期；清理周期仅由 `interval-hours` 决定。
-- `interval-hours <= 0` 时清理整体关闭，但不会重置 `lastDetailMeterCleanupAt`；`interval-hours >= 24` 时退化为每日 0 点清理一次，同日不重复清理。
+- `interval-hours <= 0` 时清理整体关闭，但不会重置已有清理基准；`interval-hours >= 24` 时退化为每日 0 点清理一次，同日不重复清理。
 
 如业务必须保留一期明细 Meter 的完整进程生命周期累计值，可以关闭定期清理，但必须接受长期运行的内存和 FGC 风险。
 
 ## 开发与验收
 
-1. 验证 `lastDetailMeterCleanupAt` 初始为 `null` 时，进程刚启动的首条事件不立即清理，仅将 `lastDetailMeterCleanupAt` 初始化为当前时间；之后进入下一固定清理点后的首条事件才执行清理；跨自然日后首条事件也立即清理。同一固定清理点内的后续事件不重复清理。
-2. 使用可注入的 `Clock` 测试 `Asia/Shanghai` 时区下的区间边界（如 `n=6` 时 06:00:00 的边界事件归属、11:59 → 12:00 跨区间）、UTC 日期不同但业务时区日期相同及跨日场景；生产代码不得通过散落的 `System.currentTimeMillis()` 判断时间。
+1. 验证清理基准初始未建立时，进程刚启动的首条事件不立即清理，仅初始化当前基准和下一个固定清理点；之后进入下一固定清理点后的首条事件才执行清理；跨自然日后首条事件也立即清理。同一固定清理点内的后续事件不重复清理。
+2. 使用可注入的 `Clock` 测试系统默认时区下的区间边界（如 `n=6` 时 06:00:00 的边界事件归属、11:59 → 12:00 跨区间）及跨日场景；生产代码不得通过散落的 `System.currentTimeMillis()` 判断时间。
 3. 验证 `n` 的取值边界：`n <= 0` 时事件路径不执行任何清理判断或操作，仅在启动读取配置或动态刷新为关闭状态时输出一次日志说明清理已关闭；`n >= 24` 时退化为每日清理一次，当日首条跨日事件清理后同日不再清理。
 4. 验证只注销 Starter 保存句柄对应的一期 SQL/URI Meter，并释放 identity、LRU、PENDING 引用及已成功注销 Meter 的注册句柄；注销失败的 Meter 继续保留准确注册句柄及所有权记录，不得影响 Druid 原生 Stat、SQL mapping、其他组件 Meter 或二期能力。
 5. 验证触发清理的当前事件在清理后正常注册并记录，清理前的事件不会在旧 Meter 上发生并发更新。
 6. 并发压测多个 SQL/URI 事件同时跨区间到达的场景，确保只清理一次，不发生漏清、双重注册、死锁或并发修改异常。
 7. 验证单个 Meter 注销失败时继续清理其他 Meter、保留失败 Meter 的准确注册句柄及所有权记录、记录限频 `WARN`，且同区间后续事件不会因失败反复执行整批清理；下一个清理周期会重试该 Meter。
-8. 验证开关、时区和 `interval-hours` 动态刷新：`prometheus.enabled=false` 或 `events.enabled=false` 时既不记录事件也不触发清理，重新启用后下一条有效事件按最近清理时间判断；合法时区立即生效，非法时区保留旧值且不影响业务事件；`interval-hours` 从合法变到 `<=0` 时立即停止清理，从 `<=0` 恢复到 `1..23` 或 `>=24` 时按已有时间与当前时间判断，若 `lastDetailMeterCleanupAt == null` 则初始化为当前时间不立即清理；`n` 在 `1..23` 与 `>=24` 之间切换时，按新语义立即作用于下一条事件。
+8. 验证开关和 `interval-hours` 动态刷新：`prometheus.enabled=false` 或 `events.enabled=false` 时既不记录事件也不触发清理，重新启用后下一条有效事件按已有固定清理点判断；`interval-hours` 从合法变到 `<=0` 时立即停止清理，从 `<=0` 恢复到 `1..23` 或 `>=24` 时按已有基准重新计算固定清理点，若基准尚未建立则由下一条事件初始化且不立即清理；`n` 在 `1..23` 与 `>=24` 之间切换时，按新语义立即作用于下一条事件。
 9. 验证一期 counter reset 后 Prometheus `rate()` / `increase()` 查询保持合理，清理窗口的 series 短暂缺失不会触发误报。
 10. 验证清理完成后输出一条组件业务日志，包含业务日期、时区、触发原因（`cross-day`/`new-interval`）、固定清理点、区间序号、`interval-hours`、开始/完成时间、耗时、清理前 SQL/URI identity 数、成功/失败注销数、触发事件类型，以及 SQL 事件的数据源名或 URI 事件的 URI 模板哈希前缀；日志不得写入结构化事件 logger，也不得包含 SQL、SQL MD5 或 URI 完整明细。事后可通过该日志核对每次清理是否按时触发、清理了多少存量对象。
 
