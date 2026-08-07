@@ -40,6 +40,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -90,6 +91,14 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
     }
 
     // ==================== calculateSqlMd5 ====================
+
+    @Test
+    public void maxWindow_supportsMillisecondsWithoutFallingBack() {
+        assertEquals(Duration.ofMillis(10L), DruidPrometheusMetricsListener.parseMaxWindow("10ms"));
+        assertEquals(Duration.ofSeconds(10L), DruidPrometheusMetricsListener.parseMaxWindow("10s"));
+        assertEquals(Duration.ofMinutes(10L), DruidPrometheusMetricsListener.parseMaxWindow("10m"));
+        assertEquals(Duration.ofMinutes(2L), DruidPrometheusMetricsListener.parseMaxWindow("invalid"));
+    }
 
     @Test
     public void sqlMd5_emptyOrBlankReturnsEmptyString() {
@@ -283,13 +292,14 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
             String sql = "select 2";
             SimpleMeterRegistry registry = new SimpleMeterRegistry();
             DruidStatProperties.Prometheus config = defaultConfig(true);
-            config.getSqlMapping().setDirectory(dir.toString());
+            config.getLogging().setDirectory(dir.toString());
+            config.getLogging().setEnabled(false);
             DruidPrometheusMetricsListener listener = newListener(config, registry, null);
             listener.init();
 
             listener.onSqlExecute(sql, dataSource("primary"), 1L, null);
 
-            Path file = dir.resolve(hash(sql) + ".sql");
+            Path file = dir.resolve("sql_mapping_" + hash(sql) + ".log");
             awaitFile(file); // Meter 同步创建，但文件落盘异步
             assertEquals(sql, new String(Files.readAllBytes(file), StandardCharsets.UTF_8));
         } finally {
@@ -303,11 +313,12 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
         try {
             String sql = "select 3";
             String hash = hash(sql);
-            Files.write(dir.resolve(hash + ".sql"), "ORIGINAL".getBytes(StandardCharsets.UTF_8));
+            Files.write(dir.resolve("sql_mapping_" + hash + ".log"), "ORIGINAL".getBytes(StandardCharsets.UTF_8));
 
             SimpleMeterRegistry registry = new SimpleMeterRegistry();
             DruidStatProperties.Prometheus config = defaultConfig(true);
-            config.getSqlMapping().setDirectory(dir.toString());
+            config.getLogging().setDirectory(dir.toString());
+            config.getLogging().setEnabled(false);
             DruidPrometheusMetricsListener listener = newListener(config, registry, null);
             listener.init();
 
@@ -315,7 +326,7 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
             awaitSqlMeter(registry, sql, "primary");
 
             assertEquals("ORIGINAL",
-                    new String(Files.readAllBytes(dir.resolve(hash + ".sql")), StandardCharsets.UTF_8));
+                    new String(Files.readAllBytes(dir.resolve("sql_mapping_" + hash + ".log")), StandardCharsets.UTF_8));
         } finally {
             deleteRecursively(dir);
         }
@@ -328,14 +339,15 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
             String sql = "select 4";
             SimpleMeterRegistry registry = new SimpleMeterRegistry();
             DruidStatProperties.Prometheus config = defaultConfig(false); // mapping disabled
-            config.getSqlMapping().setDirectory(dir.toString());
+            config.getLogging().setDirectory(dir.toString());
+            config.getLogging().setEnabled(false);
             DruidPrometheusMetricsListener listener = newListener(config, registry, null);
             listener.init();
 
             listener.onSqlExecute(sql, dataSource("primary"), 1L, null);
             awaitSqlMeter(registry, sql, "primary");
 
-            assertFalse(Files.exists(dir.resolve(hash(sql) + ".sql")));
+            assertFalse(Files.exists(dir.resolve("sql_mapping_" + hash(sql) + ".log")));
         } finally {
             deleteRecursively(dir);
         }
@@ -635,7 +647,8 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
         try {
             SimpleMeterRegistry registry = new SimpleMeterRegistry();
             DruidStatProperties.Prometheus config = defaultConfig(true);
-            config.getSqlMapping().setDirectory(dir.toString());
+            config.getLogging().setDirectory(dir.toString());
+            config.getLogging().setEnabled(false);
             config.getSqlMapping().setQueueSize(1);
             config.getEvents().setMaxSqlIdentities(10_000);
             DruidPrometheusMetricsListener listener = newListener(config, registry, null);
@@ -670,6 +683,7 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
     private static DruidStatProperties.Prometheus defaultConfig(boolean mappingEnabled) {
         DruidStatProperties.Prometheus config = new DruidStatProperties.Prometheus();
         config.getSqlMapping().setEnabled(mappingEnabled);
+        config.getLogging().setEnabled(false);
         return config;
     }
 
@@ -746,7 +760,9 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
 
         @Bean
         public DruidStatProperties druidStatProperties() {
-            return new DruidStatProperties();
+            DruidStatProperties properties = new DruidStatProperties();
+            properties.getPrometheus().getLogging().setAutoConfigure(false);
+            return properties;
         }
     }
 }

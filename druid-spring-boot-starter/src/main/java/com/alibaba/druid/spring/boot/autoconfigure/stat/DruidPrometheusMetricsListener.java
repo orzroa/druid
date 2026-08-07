@@ -21,6 +21,7 @@ import com.alibaba.druid.proxy.jdbc.DataSourceProxy;
 import com.alibaba.druid.spring.boot.autoconfigure.properties.DruidStatProperties;
 import com.alibaba.druid.support.http.WebStatEventContext;
 import com.alibaba.druid.support.http.WebStatEventListener;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -31,6 +32,8 @@ import org.springframework.beans.factory.BeanFactory;
 import org.springframework.beans.factory.BeanFactoryAware;
 import org.springframework.beans.factory.ListableBeanFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
@@ -45,11 +48,13 @@ import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
+import java.time.OffsetDateTime;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -74,16 +79,22 @@ import java.util.concurrent.TimeUnit;
  */
 public final class DruidPrometheusMetricsListener implements StatFilterEventListener, WebStatEventListener,
         DruidPrometheusMetricsRefresher, BeanFactoryAware {
+    private static final Logger LOG = LoggerFactory.getLogger(DruidPrometheusMetricsListener.class);
     /** Spring MVC 在请求属性中存放“最佳匹配路径模板”的 key，例如 {@code /users/{id}}。 */
     private static final String SPRING_MVC_PATTERN_ATTRIBUTE =
             "org.springframework.web.servlet.HandlerMapping.bestMatchingPattern";
 
     /** 当前的 Prometheus 配置快照（运行时可被 {@link #refresh} 原子替换）。 */
     private volatile DruidStatProperties.Prometheus config;
+    /** Last successfully observed values, kept separately so in-place Apollo rebinding can be detected. */
+    private volatile DruidStatProperties.Prometheus appliedConfig;
+    private final Object refreshLock = new Object();
     /** 应用已有的 MeterRegistry 提供者（Spring 注入，延迟到 init 时取出）。 */
     private final ObjectProvider<MeterRegistry> meterRegistryProvider;
     /** 可选的 URI 模板解析器（SPI），用于把原始 URI 解析为模板以压缩基数。 */
     private final ObjectProvider<DruidUriTemplateResolver> uriTemplateResolverProvider;
+    /** Structured event output. The default is deliberately silent to avoid leaking JSON into root logs. */
+    private final DruidMetricsEventSink eventSink;
 
     /**
      * 以 {@code (sqlMd5 + '\u0000' + dataSourceName)} 为 key 缓存的 SQL 状态。
@@ -101,9 +112,14 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     /** 记录 DataSourceProxy 实例到其 Spring Bean 名称的映射，避免反复扫描容器。 */
     private final ConcurrentMap<DataSourceProxy, String> dataSourceBeanNames =
             new ConcurrentHashMap<DataSourceProxy, String>();
+    /** Phase-two SQL aggregate meters, keyed only by stable datasource name. */
+    private final ConcurrentMap<String, AggregateSqlMeters> aggregateSqlMeters =
+            new ConcurrentHashMap<String, AggregateSqlMeters>();
 
     /** 实际取出并缓存的 MeterRegistry；为 null 时表示未启用指标，所有事件都会被跳过。 */
     private volatile MeterRegistry meterRegistry;
+    /** Phase-two URI aggregate meters have no business labels and are registered once. */
+    private volatile AggregateUriMeters aggregateUriMeters;
     /** 单线程、有界队列的 SQL 映射落盘执行器。 */
     private volatile ThreadPoolExecutor mappingExecutor;
     /** 容器工厂（用于反查 DataSource Bean 名）；非 ListableBeanFactory 时为 null。 */
@@ -119,9 +135,19 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     public DruidPrometheusMetricsListener(DruidStatProperties.Prometheus config,
                                            ObjectProvider<MeterRegistry> meterRegistryProvider,
                                            ObjectProvider<DruidUriTemplateResolver> uriTemplateResolverProvider) {
+        this(config, meterRegistryProvider, uriTemplateResolverProvider, DruidMetricsEventSink.NOOP);
+    }
+
+    public DruidPrometheusMetricsListener(DruidStatProperties.Prometheus config,
+                                           ObjectProvider<MeterRegistry> meterRegistryProvider,
+                                           ObjectProvider<DruidUriTemplateResolver> uriTemplateResolverProvider,
+                                           DruidMetricsEventSink eventSink) {
+        rejectInvalidThresholds(new DruidStatProperties.Prometheus().getThresholds(), config.getThresholds());
         this.config = config;
+        this.appliedConfig = copyConfig(config);
         this.meterRegistryProvider = meterRegistryProvider;
         this.uriTemplateResolverProvider = uriTemplateResolverProvider;
+        this.eventSink = eventSink == null ? DruidMetricsEventSink.NOOP : eventSink;
     }
 
     /**
@@ -131,8 +157,8 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     @PostConstruct
     public void init() {
         meterRegistry = meterRegistryProvider.getIfAvailable();
-        if (meterRegistry == null) {
-            return;
+        if (meterRegistry != null) {
+            aggregateUriMeters = createAggregateUriMeters();
         }
         int queueSize = Math.max(1, config.getSqlMapping().getQueueSize());
         // 单线程 + 有界队列 + 拒绝即抛 AbortPolicy，保证落盘不会无限堆积、也不会阻塞事件线程
@@ -155,6 +181,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         if (executor != null) {
             executor.shutdownNow();
         }
+        eventSink.close();
     }
 
     /**
@@ -166,9 +193,94 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
      */
     @Override
     public void refresh(DruidStatProperties.Prometheus config) {
-        if (config != null) {
+        if (config == null) return;
+        synchronized (refreshLock) {
+            if (this.config == config && sameConfiguration(appliedConfig, config)) return;
+            DruidStatProperties.Prometheus previous = appliedConfig;
+            rejectInvalidThresholds(previous.getThresholds(), config.getThresholds());
+            if (!eventSink.refresh(previous, config)) {
+                logRejectedAppenderChanges(previous.getLogging(), config.getLogging());
+                retainPreviousAppenderConfiguration(previous.getLogging(), config.getLogging());
+            }
             this.config = config;
+            logConfigurationChanges(previous, config);
+            appliedConfig = copyConfig(config);
         }
+    }
+
+    private DruidStatProperties.Prometheus currentConfig() {
+        DruidStatProperties.Prometheus current = config;
+        if (!sameConfiguration(appliedConfig, current)) refresh(current);
+        return config;
+    }
+
+    private void retainPreviousAppenderConfiguration(DruidStatProperties.Prometheus.Logging previous,
+                                                      DruidStatProperties.Prometheus.Logging current) {
+        current.setAutoConfigure(previous.isAutoConfigure());
+        current.setDirectory(previous.getDirectory());
+        current.setFileName(previous.getFileName());
+        current.setQueueSize(previous.getQueueSize());
+        current.setMaxFileSize(previous.getMaxFileSize());
+        current.setMaxHistoryDays(previous.getMaxHistoryDays());
+        current.setTotalSizeCap(previous.getTotalSizeCap());
+        current.setShutdownFlushTimeout(previous.getShutdownFlushTimeout());
+    }
+
+    private void logRejectedAppenderChanges(DruidStatProperties.Prometheus.Logging previous,
+                                             DruidStatProperties.Prometheus.Logging current) {
+        logRejectedChange("logging.auto-configure", previous.isAutoConfigure(), current.isAutoConfigure());
+        logRejectedChange("logging.directory", previous.getDirectory(), current.getDirectory());
+        logRejectedChange("logging.file-name", previous.getFileName(), current.getFileName());
+        logRejectedChange("logging.queue-size", previous.getQueueSize(), current.getQueueSize());
+        logRejectedChange("logging.max-file-size", previous.getMaxFileSize(), current.getMaxFileSize());
+        logRejectedChange("logging.max-history-days", previous.getMaxHistoryDays(), current.getMaxHistoryDays());
+        logRejectedChange("logging.total-size-cap", previous.getTotalSizeCap(), current.getTotalSizeCap());
+        logRejectedChange("logging.shutdown-flush-timeout", previous.getShutdownFlushTimeout(),
+                current.getShutdownFlushTimeout());
+    }
+
+    private void logRejectedChange(String property, Object retained, Object rejected) {
+        if (retained == null ? rejected == null : retained.equals(rejected)) return;
+        LOG.warn("Druid Prometheus config rejected: property={}, rejected={}, retained={}, reason=appender-rebuild-failed",
+                property, rejected, retained);
+    }
+
+    private void rejectInvalidThresholds(DruidStatProperties.Prometheus.Thresholds previous,
+                                         DruidStatProperties.Prometheus.Thresholds current) {
+        if (current.getSlowSqlMillis() < 0L) {
+            rejectThreshold("thresholds.slow-sql-millis", current.getSlowSqlMillis(), previous.getSlowSqlMillis());
+            current.setSlowSqlMillis(previous.getSlowSqlMillis());
+        }
+        if (current.getLargeSqlReadRows() < 0L) {
+            rejectThreshold("thresholds.large-sql-read-rows", current.getLargeSqlReadRows(), previous.getLargeSqlReadRows());
+            current.setLargeSqlReadRows(previous.getLargeSqlReadRows());
+        }
+        if (current.getLargeSqlWriteRows() < 0L) {
+            rejectThreshold("thresholds.large-sql-write-rows", current.getLargeSqlWriteRows(), previous.getLargeSqlWriteRows());
+            current.setLargeSqlWriteRows(previous.getLargeSqlWriteRows());
+        }
+        if (current.getSlowUriMillis() < 0L) {
+            rejectThreshold("thresholds.slow-uri-millis", current.getSlowUriMillis(), previous.getSlowUriMillis());
+            current.setSlowUriMillis(previous.getSlowUriMillis());
+        }
+        if (current.getLargeUriReadRows() < 0L) {
+            rejectThreshold("thresholds.large-uri-read-rows", current.getLargeUriReadRows(), previous.getLargeUriReadRows());
+            current.setLargeUriReadRows(previous.getLargeUriReadRows());
+        }
+        if (current.getLargeUriWriteRows() < 0L) {
+            rejectThreshold("thresholds.large-uri-write-rows", current.getLargeUriWriteRows(), previous.getLargeUriWriteRows());
+            current.setLargeUriWriteRows(previous.getLargeUriWriteRows());
+        }
+        if (current.getLargeUriSqlExecutions() < 0L) {
+            rejectThreshold("thresholds.large-uri-sql-executions", current.getLargeUriSqlExecutions(),
+                    previous.getLargeUriSqlExecutions());
+            current.setLargeUriSqlExecutions(previous.getLargeUriSqlExecutions());
+        }
+    }
+
+    private void rejectThreshold(String property, long rejected, long retained) {
+        LOG.warn("Druid Prometheus config rejected: property={}, rejected={}, retained={}, reason=negative-value",
+                property, rejected, retained);
     }
 
     /**
@@ -181,80 +293,119 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         }
     }
 
-    /**
-     * SQL 执行完成事件。仅记录成功（error == null）且非空 SQL 的耗时。
-     */
     @Override
     public void onSqlExecute(String sql, DataSourceProxy dataSource, long durationNanos, Throwable error) {
-        if (!isEnabled() || error != null || sql == null || sql.length() == 0) {
-            return;
+        DruidStatProperties.Prometheus current = currentConfig();
+        if (!isGlobalEnabled(current) || sql == null || sql.length() == 0) return;
+        String dataSourceName = dataSourceName(dataSource);
+        long safeNanos = Math.max(0L, durationNanos);
+        long durationMillis = TimeUnit.NANOSECONDS.toMillis(safeNanos);
+        long threshold = current.getThresholds().getSlowSqlMillis();
+        boolean slow = threshold > 0L && durationMillis >= threshold;
+        AggregateSqlMeters aggregate = aggregateSqlMeters(dataSourceName);
+        if (aggregate != null) {
+            aggregate.execution.record(safeNanos, TimeUnit.NANOSECONDS);
+            if (slow) aggregate.slow.increment();
         }
-        SqlState state = sqlState(sql, dataSource);
-        if (state != null && state.meters != null) {
-            state.meters.timer.record(durationNanos, TimeUnit.NANOSECONDS);
+        if (isPhaseOneEnabled(current) && error == null) {
+            SqlState state = sqlState(sql, dataSourceName, current);
+            if (state != null && state.meters != null) state.meters.timer.record(safeNanos, TimeUnit.NANOSECONDS);
+        }
+        boolean abnormal = error != null || slow;
+        if (shouldLog(current, abnormal)) {
+            String hash = calculateSqlMd5(sql);
+            submitMapping(hash, sql, current);
+            eventSink.log(sqlExecuteJson(dataSourceName, hash, durationMillis, error != null), abnormal);
         }
     }
 
-    /**
-     * SQL 更新条数事件（如 insert/update/delete 的 affected rows）。
-     * updateCount < 0 表示未知，不记录。
-     */
     @Override
     public void onSqlUpdateCount(String sql, DataSourceProxy dataSource, int updateCount) {
-        if (!isEnabled() || sql == null || sql.length() == 0) {
-            return;
+        DruidStatProperties.Prometheus current = currentConfig();
+        if (!isGlobalEnabled(current) || sql == null || sql.length() == 0 || updateCount < 0) return;
+        String dataSourceName = dataSourceName(dataSource);
+        long threshold = current.getThresholds().getLargeSqlWriteRows();
+        boolean large = threshold > 0L && updateCount >= threshold;
+        AggregateSqlMeters aggregate = aggregateSqlMeters(dataSourceName);
+        if (aggregate != null && large) aggregate.largeWrite.increment();
+        if (isPhaseOneEnabled(current)) {
+            SqlState state = sqlState(sql, dataSourceName, current);
+            if (state != null && state.meters != null) state.meters.affectedRows.record(updateCount);
         }
-        SqlState state = sqlState(sql, dataSource);
-        if (updateCount >= 0 && state != null && state.meters != null) {
-            state.meters.affectedRows.record(updateCount);
+        if (shouldLog(current, large)) {
+            String hash = calculateSqlMd5(sql);
+            submitMapping(hash, sql, current);
+            eventSink.log(sqlRowsJson("sql_write", dataSourceName, hash, updateCount), large);
         }
     }
 
-    /**
-     * ResultSet 关闭事件：记录该次查询抓取的行数（fetched rows）。
-     * 仅在 ResultSet 关闭时才记录，符合“查询完成后才统计”的语义。
-     */
     @Override
     public void onSqlResultSetClose(String sql, DataSourceProxy dataSource, int fetchRowCount) {
-        if (!isEnabled() || sql == null || sql.length() == 0) {
-            return;
+        DruidStatProperties.Prometheus current = currentConfig();
+        if (!isGlobalEnabled(current) || sql == null || sql.length() == 0 || fetchRowCount < 0) return;
+        String dataSourceName = dataSourceName(dataSource);
+        long threshold = current.getThresholds().getLargeSqlReadRows();
+        boolean large = threshold > 0L && fetchRowCount >= threshold;
+        AggregateSqlMeters aggregate = aggregateSqlMeters(dataSourceName);
+        if (aggregate != null && large) aggregate.largeRead.increment();
+        if (isPhaseOneEnabled(current)) {
+            SqlState state = sqlState(sql, dataSourceName, current);
+            if (state != null && state.meters != null) state.meters.fetchedRows.record(fetchRowCount);
         }
-        SqlState state = sqlState(sql, dataSource);
-        if (state != null && state.meters != null) {
-            state.meters.fetchedRows.record(fetchRowCount);
+        if (shouldLog(current, large)) {
+            String hash = calculateSqlMd5(sql);
+            submitMapping(hash, sql, current);
+            eventSink.log(sqlRowsJson("sql_read", dataSourceName, hash, fetchRowCount), large);
         }
     }
 
-    /**
-     * Web 请求事件：解析 URI 模板，记录请求耗时、以及本次请求触发的 JDBC 执行/影响/抓取行数。
-     */
     @Override
     public void onWebRequest(HttpServletRequest request, String uri, long durationNanos,
                              long jdbcExecuteCount, long jdbcUpdateCount,
                              long jdbcFetchRowCount, Throwable error) {
-        if (!isEnabled()) {
-            return;
+        DruidStatProperties.Prometheus current = currentConfig();
+        if (!isGlobalEnabled(current)) return;
+        long safeNanos = Math.max(0L, durationNanos);
+        long durationMillis = TimeUnit.NANOSECONDS.toMillis(safeNanos);
+        DruidStatProperties.Prometheus.Thresholds thresholds = current.getThresholds();
+        boolean slow = thresholds.getSlowUriMillis() > 0L && durationMillis >= thresholds.getSlowUriMillis();
+        boolean largeRead = thresholds.getLargeUriReadRows() > 0L && jdbcFetchRowCount >= thresholds.getLargeUriReadRows();
+        boolean largeWrite = thresholds.getLargeUriWriteRows() > 0L && jdbcUpdateCount >= thresholds.getLargeUriWriteRows();
+        boolean largeSql = thresholds.getLargeUriSqlExecutions() > 0L
+                && jdbcExecuteCount >= thresholds.getLargeUriSqlExecutions();
+        AggregateUriMeters aggregate = aggregateUriMeters;
+        if (aggregate != null) {
+            aggregate.request.record(safeNanos, TimeUnit.NANOSECONDS);
+            if (slow) aggregate.slow.increment();
+            if (largeRead) aggregate.largeRead.increment();
+            if (largeWrite) aggregate.largeWrite.increment();
+            if (largeSql) aggregate.largeSqlExecutions.increment();
         }
-        // 解析为模板（应用 SPI → Spring MVC pattern → 原始 URI），以压缩 URI 标签基数
-        String template = resolveUri(request, uri);
-        if (template == null || template.length() == 0) {
-            return;
+        if (isPhaseOneEnabled(current)) {
+            String template = resolveUri(request, uri, current);
+            if (template != null && template.length() != 0) {
+                UriMeters meters = uriMeters(template);
+                if (meters != null) {
+                    meters.timer.record(safeNanos, TimeUnit.NANOSECONDS);
+                    if (jdbcExecuteCount >= 0) meters.jdbcExecutions.record(jdbcExecuteCount);
+                    if (jdbcUpdateCount >= 0) meters.jdbcAffectedRows.record(jdbcUpdateCount);
+                    if (jdbcFetchRowCount >= 0) meters.jdbcFetchedRows.record(jdbcFetchRowCount);
+                }
+            }
         }
-        UriMeters meters = uriMeters(template);
-        if (meters == null) {
-            return;
+        boolean abnormal = error != null || slow || largeRead || largeWrite || largeSql;
+        if (shouldLog(current, abnormal)) {
+            eventSink.log(uriJson(uri, durationMillis, jdbcExecuteCount, jdbcUpdateCount,
+                    jdbcFetchRowCount, error != null), abnormal);
         }
-        meters.timer.record(durationNanos, TimeUnit.NANOSECONDS);
-        if (jdbcExecuteCount >= 0) meters.jdbcExecutions.record(jdbcExecuteCount);
-        if (jdbcUpdateCount >= 0) meters.jdbcAffectedRows.record(jdbcUpdateCount);
-        if (jdbcFetchRowCount >= 0) meters.jdbcFetchedRows.record(jdbcFetchRowCount);
     }
 
-    /**
-     * 判断指标收集是否在当前配置下启用：必须有 MeterRegistry、且 enabled 与 events.enabled 均为 true。
-     */
-    private boolean isEnabled() {
-        return meterRegistry != null && config.isEnabled() && config.getEvents().isEnabled();
+    private boolean isGlobalEnabled(DruidStatProperties.Prometheus current) {
+        return current != null && current.isEnabled();
+    }
+
+    private boolean isPhaseOneEnabled(DruidStatProperties.Prometheus current) {
+        return meterRegistry != null && isGlobalEnabled(current) && current.getEvents().isEnabled();
     }
 
     /**
@@ -265,12 +416,11 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
      *
      * @return SQL 状态；无法处理时返回 null
      */
-    private SqlState sqlState(String sql, DataSourceProxy dataSource) {
+    private SqlState sqlState(String sql, String dataSourceName, DruidStatProperties.Prometheus currentConfig) {
         String hash = calculateSqlMd5(sql);
         if (hash.length() == 0) {
             return null;
         }
-        String dataSourceName = dataSourceName(dataSource);
         String key = hash + '\u0000' + dataSourceName;
         SqlState current = sqlStates.get(key);
         if (current != null) {
@@ -293,7 +443,10 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             }
             trimSqlStates(maxSqlIdentities() - 1);
             sqlStates.put(key, candidate);
-            submitMapping(candidate);
+            if (currentConfig.getLogging().isEnabled() || currentConfig.getSqlMapping().isEnabled()) {
+                submitMapping(candidate.hash, candidate.sql, currentConfig);
+            }
+            candidate.sql = null;
             return candidate;
         }
     }
@@ -328,30 +481,27 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
      * 把“写 SQL 映射文件”的任务提交给落盘线程（Meter 已在 {@link #sqlState} 中同步创建）。
      * 若线程不可用或队列已满，仅跳过落盘，不丢弃已创建的 Meter，避免丢失观测。
      */
-    private void submitMapping(final SqlState state) {
+    private void submitMapping(final String hash, final String sql,
+                               DruidStatProperties.Prometheus currentConfig) {
+        if (hash == null || hash.length() == 0 || sql == null || sql.length() == 0) return;
+        boolean requiredByLogging = currentConfig.getLogging().isEnabled();
+        if (!requiredByLogging && !currentConfig.getSqlMapping().isEnabled()) return;
         ThreadPoolExecutor executor = mappingExecutor;
-        if (executor == null) {
-            // 无落盘线程：保留 Meter，仅释放 SQL 原文
-            state.sql = null;
-            return;
-        }
+        if (executor == null) return;
+        final String directory = currentConfig.getLogging().getDirectory();
         try {
             executor.execute(new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        writeSqlMapping(state.hash, state.sql);
+                        writeSqlMapping(hash, sql, directory);
                     } catch (RuntimeException ignored) {
-                        // 落盘失败不影响已有 Meter，仅放弃本次映射写盘
-                    } finally {
-                        // SQL 文本已落盘（或放弃落盘），释放内存中的原文
-                        state.sql = null;
+                        // Mapping is diagnostic data; failures must never affect SQL execution.
                     }
                 }
             });
         } catch (RuntimeException e) {
-            // 队列满触发 AbortPolicy：保留 Meter，仅释放 SQL 原文
-            state.sql = null;
+            // Bounded queue full: a later emitted event may retry the same mapping.
         }
     }
 
@@ -429,17 +579,253 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         }
     }
 
+    private AggregateSqlMeters aggregateSqlMeters(String dataSource) {
+        MeterRegistry registry = meterRegistry;
+        if (registry == null) return null;
+        AggregateSqlMeters existing = aggregateSqlMeters.get(dataSource);
+        if (existing != null) return existing;
+        try {
+            Tags tags = Tags.of("datasource", dataSource);
+            AggregateSqlMeters created = new AggregateSqlMeters(
+                    Timer.builder("druid.agg.sql.execution.duration").tags(tags).register(registry),
+                    Counter.builder("druid.agg.sql.slow").tags(tags).register(registry),
+                    Counter.builder("druid.agg.sql.large.read").tags(tags).register(registry),
+                    Counter.builder("druid.agg.sql.large.write").tags(tags).register(registry));
+            AggregateSqlMeters raced = aggregateSqlMeters.putIfAbsent(dataSource, created);
+            return raced == null ? created : raced;
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    private AggregateUriMeters createAggregateUriMeters() {
+        try {
+            return new AggregateUriMeters(
+                    Timer.builder("druid.agg.uri.request.duration").register(meterRegistry),
+                    Counter.builder("druid.agg.uri.slow").register(meterRegistry),
+                    Counter.builder("druid.agg.uri.large.read").register(meterRegistry),
+                    Counter.builder("druid.agg.uri.large.write").register(meterRegistry),
+                    Counter.builder("druid.agg.uri.large.sql.executions").register(meterRegistry));
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    private boolean shouldLog(DruidStatProperties.Prometheus current, boolean abnormal) {
+        if (!current.getLogging().isEnabled() || !eventSink.isActive()) return false;
+        if (abnormal) return true;
+        double rate = current.getLogging().getNormalSampleRate();
+        if (Double.isNaN(rate) || rate <= 0D) return false;
+        return rate >= 1D || ThreadLocalRandom.current().nextDouble() < rate;
+    }
+
+    private static String sqlExecuteJson(String dataSource, String hash, long durationMillis, boolean error) {
+        return new StringBuilder(160)
+                .append("{\"timestamp\":\"").append(jsonEscape(OffsetDateTime.now().toString()))
+                .append("\",\"event\":\"sql_execute\",\"datasource\":\"").append(jsonEscape(dataSource))
+                .append("\",\"sql_md5\":\"").append(jsonEscape(hash))
+                .append("\",\"duration_ms\":").append(durationMillis)
+                .append(",\"error\":").append(error).append('}').toString();
+    }
+
+    private static String sqlRowsJson(String event, String dataSource, String hash, long rows) {
+        return new StringBuilder(144)
+                .append("{\"timestamp\":\"").append(jsonEscape(OffsetDateTime.now().toString()))
+                .append("\",\"event\":\"").append(event)
+                .append("\",\"datasource\":\"").append(jsonEscape(dataSource))
+                .append("\",\"sql_md5\":\"").append(jsonEscape(hash))
+                .append("\",\"rows\":").append(rows).append('}').toString();
+    }
+
+    private static String uriJson(String uri, long durationMillis, long sqlCount,
+                                  long writeRows, long readRows, boolean error) {
+        return new StringBuilder(192)
+                .append("{\"timestamp\":\"").append(jsonEscape(OffsetDateTime.now().toString()))
+                .append("\",\"event\":\"uri\",\"uri\":\"").append(jsonEscape(uri))
+                .append("\",\"duration_ms\":").append(durationMillis)
+                .append(",\"sql_count\":").append(sqlCount)
+                .append(",\"write_rows\":").append(writeRows)
+                .append(",\"read_rows\":").append(readRows)
+                .append(",\"error\":").append(error).append('}').toString();
+    }
+
+    static String jsonEscape(String value) {
+        if (value == null) return "";
+        StringBuilder escaped = new StringBuilder(value.length() + 16);
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            switch (ch) {
+                case '\\': escaped.append("\\\\"); break;
+                case '"': escaped.append("\\\""); break;
+                case '\n': escaped.append("\\n"); break;
+                case '\r': escaped.append("\\r"); break;
+                case '\t': escaped.append("\\t"); break;
+                case '\b': escaped.append("\\b"); break;
+                case '\f': escaped.append("\\f"); break;
+                default:
+                    if (ch < 0x20) {
+                        String hex = Integer.toHexString(ch);
+                        escaped.append("\\u");
+                        for (int j = hex.length(); j < 4; j++) escaped.append('0');
+                        escaped.append(hex);
+                    } else {
+                        escaped.append(ch);
+                    }
+            }
+        }
+        return escaped.toString();
+    }
+
+    private static DruidStatProperties.Prometheus copyConfig(DruidStatProperties.Prometheus source) {
+        DruidStatProperties.Prometheus copy = new DruidStatProperties.Prometheus();
+        copy.setEnabled(source.isEnabled());
+        copy.getEvents().setEnabled(source.getEvents().isEnabled());
+        copy.getEvents().setMaxSqlIdentities(source.getEvents().getMaxSqlIdentities());
+        copy.getEvents().setMaxUriIdentities(source.getEvents().getMaxUriIdentities());
+        copy.getEvents().setMaxWindow(source.getEvents().getMaxWindow());
+        copy.getSqlMapping().setEnabled(source.getSqlMapping().isEnabled());
+        copy.getSqlMapping().setDirectory(source.getSqlMapping().getDirectory());
+        copy.getSqlMapping().setQueueSize(source.getSqlMapping().getQueueSize());
+        copy.getUriTemplate().setIncludeContextPath(source.getUriTemplate().isIncludeContextPath());
+        copyThresholds(source.getThresholds(), copy.getThresholds());
+        copyLogging(source.getLogging(), copy.getLogging());
+        return copy;
+    }
+
+    private static void copyThresholds(DruidStatProperties.Prometheus.Thresholds source,
+                                       DruidStatProperties.Prometheus.Thresholds target) {
+        target.setSlowSqlMillis(source.getSlowSqlMillis());
+        target.setLargeSqlReadRows(source.getLargeSqlReadRows());
+        target.setLargeSqlWriteRows(source.getLargeSqlWriteRows());
+        target.setSlowUriMillis(source.getSlowUriMillis());
+        target.setLargeUriReadRows(source.getLargeUriReadRows());
+        target.setLargeUriWriteRows(source.getLargeUriWriteRows());
+        target.setLargeUriSqlExecutions(source.getLargeUriSqlExecutions());
+    }
+
+    private static void copyLogging(DruidStatProperties.Prometheus.Logging source,
+                                    DruidStatProperties.Prometheus.Logging target) {
+        target.setEnabled(source.isEnabled());
+        target.setAutoConfigure(source.isAutoConfigure());
+        target.setNormalSampleRate(source.getNormalSampleRate());
+        target.setDirectory(source.getDirectory());
+        target.setFileName(source.getFileName());
+        target.setQueueSize(source.getQueueSize());
+        target.setMaxFileSize(source.getMaxFileSize());
+        target.setMaxHistoryDays(source.getMaxHistoryDays());
+        target.setTotalSizeCap(source.getTotalSizeCap());
+        target.setShutdownFlushTimeout(source.getShutdownFlushTimeout());
+    }
+
+    private static boolean sameConfiguration(DruidStatProperties.Prometheus first,
+                                             DruidStatProperties.Prometheus second) {
+        if (first == second) return true;
+        if (first == null || second == null) return false;
+        return first.isEnabled() == second.isEnabled()
+                && first.getEvents().isEnabled() == second.getEvents().isEnabled()
+                && first.getEvents().getMaxSqlIdentities() == second.getEvents().getMaxSqlIdentities()
+                && first.getEvents().getMaxUriIdentities() == second.getEvents().getMaxUriIdentities()
+                && equal(first.getEvents().getMaxWindow(), second.getEvents().getMaxWindow())
+                && first.getSqlMapping().isEnabled() == second.getSqlMapping().isEnabled()
+                && equal(first.getSqlMapping().getDirectory(), second.getSqlMapping().getDirectory())
+                && first.getSqlMapping().getQueueSize() == second.getSqlMapping().getQueueSize()
+                && first.getUriTemplate().isIncludeContextPath()
+                    == second.getUriTemplate().isIncludeContextPath()
+                && sameThresholds(first.getThresholds(), second.getThresholds())
+                && sameLogging(first.getLogging(), second.getLogging());
+    }
+
+    private static boolean sameThresholds(DruidStatProperties.Prometheus.Thresholds first,
+                                          DruidStatProperties.Prometheus.Thresholds second) {
+        return first.getSlowSqlMillis() == second.getSlowSqlMillis()
+                && first.getLargeSqlReadRows() == second.getLargeSqlReadRows()
+                && first.getLargeSqlWriteRows() == second.getLargeSqlWriteRows()
+                && first.getSlowUriMillis() == second.getSlowUriMillis()
+                && first.getLargeUriReadRows() == second.getLargeUriReadRows()
+                && first.getLargeUriWriteRows() == second.getLargeUriWriteRows()
+                && first.getLargeUriSqlExecutions() == second.getLargeUriSqlExecutions();
+    }
+
+    private static boolean sameLogging(DruidStatProperties.Prometheus.Logging first,
+                                       DruidStatProperties.Prometheus.Logging second) {
+        return first.isEnabled() == second.isEnabled()
+                && first.isAutoConfigure() == second.isAutoConfigure()
+                && Double.compare(first.getNormalSampleRate(), second.getNormalSampleRate()) == 0
+                && equal(first.getDirectory(), second.getDirectory())
+                && equal(first.getFileName(), second.getFileName())
+                && first.getQueueSize() == second.getQueueSize()
+                && equal(first.getMaxFileSize(), second.getMaxFileSize())
+                && first.getMaxHistoryDays() == second.getMaxHistoryDays()
+                && equal(first.getTotalSizeCap(), second.getTotalSizeCap())
+                && equal(first.getShutdownFlushTimeout(), second.getShutdownFlushTimeout());
+    }
+
+    private static boolean equal(Object first, Object second) {
+        return first == null ? second == null : first.equals(second);
+    }
+
+    private void logConfigurationChanges(DruidStatProperties.Prometheus previous,
+                                         DruidStatProperties.Prometheus current) {
+        if (previous == null) return;
+        logChange("enabled", previous.isEnabled(), current.isEnabled(), "next-event");
+        logChange("events.enabled", previous.getEvents().isEnabled(), current.getEvents().isEnabled(), "next-event");
+        logChange("events.max-sql-identities", previous.getEvents().getMaxSqlIdentities(),
+                current.getEvents().getMaxSqlIdentities(), "next-event");
+        logChange("events.max-uri-identities", previous.getEvents().getMaxUriIdentities(),
+                current.getEvents().getMaxUriIdentities(), "next-event");
+        logChange("events.max-window", previous.getEvents().getMaxWindow(),
+                current.getEvents().getMaxWindow(), "new-meters");
+        logChange("sql-mapping.enabled", previous.getSqlMapping().isEnabled(),
+                current.getSqlMapping().isEnabled(), "next-event");
+        logChange("sql-mapping.directory", previous.getSqlMapping().getDirectory(),
+                current.getSqlMapping().getDirectory(), "ignored-use-logging.directory");
+        logChange("sql-mapping.queue-size", previous.getSqlMapping().getQueueSize(),
+                current.getSqlMapping().getQueueSize(), "restart-required");
+        logChange("uri-template.include-context-path", previous.getUriTemplate().isIncludeContextPath(),
+                current.getUriTemplate().isIncludeContextPath(), "next-event");
+        logThresholdChanges(previous.getThresholds(), current.getThresholds());
+        logLoggingChanges(previous.getLogging(), current.getLogging());
+    }
+
+    private void logThresholdChanges(DruidStatProperties.Prometheus.Thresholds oldValue,
+                                     DruidStatProperties.Prometheus.Thresholds newValue) {
+        logChange("thresholds.slow-sql-millis", oldValue.getSlowSqlMillis(), newValue.getSlowSqlMillis(), "next-event");
+        logChange("thresholds.large-sql-read-rows", oldValue.getLargeSqlReadRows(), newValue.getLargeSqlReadRows(), "next-event");
+        logChange("thresholds.large-sql-write-rows", oldValue.getLargeSqlWriteRows(), newValue.getLargeSqlWriteRows(), "next-event");
+        logChange("thresholds.slow-uri-millis", oldValue.getSlowUriMillis(), newValue.getSlowUriMillis(), "next-event");
+        logChange("thresholds.large-uri-read-rows", oldValue.getLargeUriReadRows(), newValue.getLargeUriReadRows(), "next-event");
+        logChange("thresholds.large-uri-write-rows", oldValue.getLargeUriWriteRows(), newValue.getLargeUriWriteRows(), "next-event");
+        logChange("thresholds.large-uri-sql-executions", oldValue.getLargeUriSqlExecutions(), newValue.getLargeUriSqlExecutions(), "next-event");
+    }
+
+    private void logLoggingChanges(DruidStatProperties.Prometheus.Logging oldValue,
+                                   DruidStatProperties.Prometheus.Logging newValue) {
+        logChange("logging.enabled", oldValue.isEnabled(), newValue.isEnabled(), "next-event");
+        logChange("logging.auto-configure", oldValue.isAutoConfigure(), newValue.isAutoConfigure(), "appender-rebuild");
+        logChange("logging.normal-sample-rate", oldValue.getNormalSampleRate(), newValue.getNormalSampleRate(), "next-event");
+        logChange("logging.directory", oldValue.getDirectory(), newValue.getDirectory(), "appender-rebuild");
+        logChange("logging.file-name", oldValue.getFileName(), newValue.getFileName(), "appender-rebuild");
+        logChange("logging.queue-size", oldValue.getQueueSize(), newValue.getQueueSize(), "appender-rebuild");
+        logChange("logging.max-file-size", oldValue.getMaxFileSize(), newValue.getMaxFileSize(), "appender-rebuild");
+        logChange("logging.max-history-days", oldValue.getMaxHistoryDays(), newValue.getMaxHistoryDays(), "appender-rebuild");
+        logChange("logging.total-size-cap", oldValue.getTotalSizeCap(), newValue.getTotalSizeCap(), "appender-rebuild");
+        logChange("logging.shutdown-flush-timeout", oldValue.getShutdownFlushTimeout(),
+                newValue.getShutdownFlushTimeout(), "next-close");
+    }
+
+    private void logChange(String property, Object oldValue, Object newValue, String effect) {
+        if (oldValue == null ? newValue == null : oldValue.equals(newValue)) return;
+        LOG.info("Druid Prometheus config changed: property={}, old={}, new={}, effect={}",
+                property, oldValue, newValue, effect);
+    }
+
     /**
      * 将 SQL 文本按 MD5 文件名落盘，便于后续在 Grafana 等侧把 md5 还原为可读 SQL。
      * 使用原子移动避免并发重复写；已存在同名文件则跳过。
      */
-    private void writeSqlMapping(String hash, String sql) {
-        if (!config.getSqlMapping().isEnabled()) {
-            return;
-        }
-        Path directory = Paths.get(config.getSqlMapping().getDirectory());
-        // 落盘文件名带上 .sql 后缀，便于人工识别与编辑器语法高亮
-        Path target = directory.resolve(hash + ".sql");
+    private void writeSqlMapping(String hash, String sql, String configuredDirectory) {
+        Path directory = Paths.get(configuredDirectory == null ? "./logs" : configuredDirectory);
+        Path target = directory.resolve("sql_mapping_" + hash + ".log");
         try {
             if (Files.exists(target)) {
                 return;
@@ -449,7 +835,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
                 return;
             }
             // 先写临时文件再原子重命名，保证目标文件要么完整存在、要么不存在
-            Path temporary = Files.createTempFile(directory, hash, ".sql.tmp");
+            Path temporary = Files.createTempFile(directory, "sql_mapping_" + hash, ".log.tmp");
             try {
                 Files.write(temporary, sql.getBytes(StandardCharsets.UTF_8));
                 try {
@@ -478,7 +864,8 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
      * </ol>
      * 若开启了 {@code include-context-path}，则拼接 contextPath 前缀。
      */
-    private String resolveUri(HttpServletRequest request, String fallback) {
+    private String resolveUri(HttpServletRequest request, String fallback,
+                              DruidStatProperties.Prometheus current) {
         DruidUriTemplateResolver resolver = uriTemplateResolverProvider.getIfAvailable();
         String value = resolver == null ? null : resolver.resolve(request);
         if (value == null || value.length() == 0) {
@@ -488,7 +875,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         if (value == null || value.length() == 0) {
             value = fallback;
         }
-        if (config.getUriTemplate().isIncludeContextPath() && value != null
+        if (current.getUriTemplate().isIncludeContextPath() && value != null
                 && value.startsWith("/") && request.getContextPath() != null) {
             value = request.getContextPath() + value;
         }
@@ -575,16 +962,23 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
      * 该值只影响之后新建 Meter 的分布统计半衰期。
      */
     private Duration maxWindow() {
-        String value = config.getEvents().getMaxWindow();
+        return parseMaxWindow(config.getEvents().getMaxWindow());
+    }
+
+    static Duration parseMaxWindow(String value) {
         if (value == null || value.length() == 0) {
             return Duration.ofMinutes(2);
         }
         String trimmed = value.trim().toLowerCase();
         try {
             Duration window = null;
-            if (trimmed.endsWith("ms")) window = Duration.ofMillis(Long.parseLong(trimmed.substring(0, trimmed.length() - 2)));
-            if (trimmed.endsWith("s")) window = Duration.ofSeconds(Long.parseLong(trimmed.substring(0, trimmed.length() - 1)));
-            if (trimmed.endsWith("m")) window = Duration.ofMinutes(Long.parseLong(trimmed.substring(0, trimmed.length() - 1)));
+            if (trimmed.endsWith("ms")) {
+                window = Duration.ofMillis(Long.parseLong(trimmed.substring(0, trimmed.length() - 2)));
+            } else if (trimmed.endsWith("s")) {
+                window = Duration.ofSeconds(Long.parseLong(trimmed.substring(0, trimmed.length() - 1)));
+            } else if (trimmed.endsWith("m")) {
+                window = Duration.ofMinutes(Long.parseLong(trimmed.substring(0, trimmed.length() - 1)));
+            }
             if (window != null && !window.isNegative() && !window.isZero()) return window;
         } catch (NumberFormatException ignored) {
         }
@@ -723,6 +1117,37 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             return out.toString();
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException(e);
+        }
+    }
+
+    private static final class AggregateSqlMeters {
+        private final Timer execution;
+        private final Counter slow;
+        private final Counter largeRead;
+        private final Counter largeWrite;
+
+        private AggregateSqlMeters(Timer execution, Counter slow, Counter largeRead, Counter largeWrite) {
+            this.execution = execution;
+            this.slow = slow;
+            this.largeRead = largeRead;
+            this.largeWrite = largeWrite;
+        }
+    }
+
+    private static final class AggregateUriMeters {
+        private final Timer request;
+        private final Counter slow;
+        private final Counter largeRead;
+        private final Counter largeWrite;
+        private final Counter largeSqlExecutions;
+
+        private AggregateUriMeters(Timer request, Counter slow, Counter largeRead,
+                                   Counter largeWrite, Counter largeSqlExecutions) {
+            this.request = request;
+            this.slow = slow;
+            this.largeRead = largeRead;
+            this.largeWrite = largeWrite;
+            this.largeSqlExecutions = largeSqlExecutions;
         }
     }
 

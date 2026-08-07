@@ -40,7 +40,7 @@ SQL / URI 事件（同一事件流）
 一期设计文档作为历史基线不修改；二期实现仅对一期的 SQL mapping 辅助能力作如下定向调整，其余一期 Meter 名称、标签、LRU、URI 模板、窗口和配置语义均保持不变：
 
 1. 映射文件由原来的 `<md5>.sql` 改为 `sql_mapping_<md5>.log`，并与结构化事件日志共用 `logging.directory`；SQL 内容格式、MD5 算法、原子写入、目标存在即跳过和有界异步写入语义不变。
-2. `sql-mapping.enabled`、`sql-mapping.queue-size` 配置和写盘线程保留，不能被 `sql_declaration` 或二期事件日志替代或删除；`sql-mapping.directory` 在二期不再生效，统一使用 `logging.directory`。
+2. `sql-mapping.enabled`、`sql-mapping.queue-size` 配置和写盘线程保留，不能被二期事件日志替代或删除；`sql-mapping.directory` 在二期不再生效，统一使用 `logging.directory`。
 3. 当 `events.enabled=false`、`logging.enabled=true` 时，mapping 仍为实际输出的 SQL 业务日志生成文件，确保二期日志中的 `sql_md5` 可在末端查到模板；这使 SQL mapping 成为一期与二期日志共用的辅助能力，此时不读取一期 `sql-mapping.enabled`。
 4. Fluent 采集规则由部署侧配置：采集 `${spring.datasource.druid.prometheus.logging.directory}/sql_mapping_*.log`，保留源文件路径，并将文件内容传给末端；末端从路径提取 MD5 后汇总映射。
 
@@ -206,7 +206,7 @@ spring.datasource.druid.prometheus.logging.shutdown-flush-timeout=3s
 
 - 业务事件线程只构造 JSON 并调用 `druid.metrics.event` logger，文件 I/O 由日志框架的异步 appender 执行；
 - 专用 Logback AsyncAppender 使用 `queueSize=queue-size`、`neverBlock=true` 和 Logback 默认 `discardingThreshold`；专用 RollingFileAppender 顺序写入，保证每条事件一行且不会交错；
-- 正常采样事件使用 `INFO`，执行失败、慢事件和大结果事件使用 `WARN`；Logback 异步 appender 优先丢弃低级别事件；
+- 正常采样事件使用 `INFO`，执行失败、慢事件和大结果事件使用 `WARN`；达到 Logback 默认丢弃阈值后，`INFO` 可被优先丢弃，`WARN` 仅在队列彻底满等紧急情况下整条丢弃；
 - 队列彻底满时 `WARN` 仍可能整条丢失，日志处理不能阻塞业务请求；因此“异常全量记录”指日志系统及进程正常运行条件下的全量记录，不承诺在队列耗尽、磁盘故障或进程崩溃时零丢失；
 - 文件由日志框架按大小和日期轮转，应用退出时执行有限时间 flush；
 - 目录自动创建，路径不合法或不可写时只记录一次启动错误并关闭专用 appender，不影响 SQL/HTTP 主流程；
@@ -266,7 +266,7 @@ SQL 指标和日志依赖 Druid `StatFilter`，URI 指标和日志依赖 `WebSta
 1. 保留一期现有 Meter 名称、标签、LRU、URI template、max window、`sql-mapping.enabled`、`sql-mapping.queue-size` 配置及映射写盘能力；原有一期测试不得删除或降低断言。SQL 映射文件的唯一命名规则调整为 `sql_mapping_<md5>.log`，并统一写入 `logging.directory`；SQL 内容格式及其余原子写入、目标存在即跳过和有界异步写入语义保持不变。
 2. 复用一个 listener 和同一批 SQL execute、update count、ResultSet close、Web 请求事件；一期分支由 `events.enabled` 控制，二期聚合分支由总开关控制，日志分支由 `logging.enabled` 控制。同一事件不得重复向同一期分支记录。
 3. 二期 URI Meter 启动时固定注册，二期 SQL Meter 按稳定的 `datasource` 懒注册。共新增 9 种 `druid.agg.*` Meter，不按 SQL/URI 创建 Meter，也不与一期名称重叠。
-4. SQL MD5、规整 SQL、URI 和原始 SQL 都不得用于二期 Prometheus 标签或进程内明细缓存；SQL MD5 作为三类 SQL 业务日志字段使用，规整 SQL 只写入 `sql_mapping_<md5>.log`。SQL 业务事件（execute/read/write）不得携带 `sql_template`，也不维护 `sql_declaration` 或其他 SQL 声明去重集合。
+4. SQL MD5、规整 SQL、URI 和原始 SQL 都不得用于二期 Prometheus 标签或进程内明细缓存；SQL MD5 作为三类 SQL 业务日志字段使用，规整 SQL 只写入 `sql_mapping_<md5>.log`。SQL 业务事件（execute/read/write）不得携带 `sql_template`，也不维护其他 SQL 声明去重集合。
 5. 开关矩阵测试必须覆盖总开关、一期开关、日志开关的全部组合；关闭一期时二期仍递增，关闭日志时两期指标仍递增，关闭总开关时三条分支均不更新。开关重新打开后复用已有 Meter 继续累计。
 6. 二期指标测试应验证不同 SQL 在同一 datasource 下命中相同 Meter、不同稳定 datasource 分别聚合、不同 URI 命中同一无标签 Meter、配置刷新在下一次事件生效，以及二期 Meter 数量不随 SQL/URI 数量增加。
 7. 集成验收时同时开启两期，确认一期序列仍含 `sql`/`uri` 标签，二期 `druid_agg_*` 序列不含 `sql`/`uri`，二期 SQL 指标的业务标签仅为 `datasource`；检查两期 metric family 无名称或 label-key 冲突。
@@ -278,7 +278,7 @@ SQL 指标和日志依赖 Druid `StatFilter`，URI 指标和日志依赖 `WebSta
 
 ## 评审发现的问题
 
-已确定的处理：一期 `sql-mapping` 保留，不再使用 `sql_declaration`；映射文件统一为 `sql_mapping_<md5>.log`，由 Fluent 采集并在末端按文件路径中的 MD5 汇总。该方案避免事件日志轮转导致映射先失效，也不引入 SQL 声明去重集合。
+已确定的处理：一期 `sql-mapping` 保留，不增加单独的 SQL 声明事件；映射文件统一为 `sql_mapping_<md5>.log`，由 Fluent 采集并在末端按文件路径中的 MD5 汇总。该方案避免事件日志轮转导致映射先失效，也不引入 SQL 声明去重集合。
 
 以下评审结论已确认并纳入设计或验收边界：
 

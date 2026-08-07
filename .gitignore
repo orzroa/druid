@@ -14,3 +14,6 @@ out/
 *.iws
 *.iml
 /bin
+
+.codebuddy/
+*/logs/
