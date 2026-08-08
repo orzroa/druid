@@ -36,6 +36,10 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Handler;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -231,6 +235,41 @@ public class DruidMeterCleanupTest {
         assertEquals(0, registry.find("druid.uri.request.duration").meters().size());
     }
 
+    @Test
+    public void uriTriggeredCleanup_logsResolvedUriTemplateDirectly() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-08-07T10:00:00Z"), ZoneOffset.UTC);
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        DruidPrometheusMetricsListener listener = newListener(cleanupConfig(3), registry, clock);
+        listener.init();
+        listener.onWebRequest(request("/users/{id}", null), "/users/1", 100L, 0, 0, 0, null);
+
+        final AtomicReference<String> cleanupMessage = new AtomicReference<String>();
+        Logger cleanupLogger = Logger.getLogger("druid.prometheus.cleanup");
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                if (record != null && record.getMessage() != null
+                        && record.getMessage().contains("triggerType=uri")) {
+                    cleanupMessage.set(record.getMessage());
+                }
+            }
+
+            @Override public void flush() { }
+            @Override public void close() { }
+        };
+        cleanupLogger.addHandler(handler);
+        try {
+            clock.setInstant(Instant.parse("2026-08-07T12:05:00Z"));
+            listener.onWebRequest(request("/reports/{date}", null), "/reports/2026-08-07",
+                    100L, 0, 0, 0, null);
+        } finally {
+            cleanupLogger.removeHandler(handler);
+        }
+
+        assertNotNull(cleanupMessage.get());
+        assertTrue(cleanupMessage.get().contains("triggerSource=/reports/{date}"));
+    }
+
     // ==================== 动态刷新 ====================
 
     @Test
@@ -342,7 +381,7 @@ public class DruidMeterCleanupTest {
         cleanupThread.setDaemon(true);
         cleanupThread.start();
 
-        // 清理线程已经进入 remove()，此时确定持有 cleanupLock 写锁。
+        // 清理线程已经进入 remove()，此时确定持有清理组件写锁。
         assertTrue(registry.awaitRemoveEntered(5, TimeUnit.SECONDS));
         Thread recordThread = new Thread(new Runnable() {
             @Override public void run() {
