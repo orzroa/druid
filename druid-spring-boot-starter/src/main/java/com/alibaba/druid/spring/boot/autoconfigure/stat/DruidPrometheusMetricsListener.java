@@ -122,6 +122,8 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
 
     /** 实际取出并缓存的 MeterRegistry；为 null 时表示未启用指标，所有事件都会被跳过。 */
     private volatile MeterRegistry meterRegistry;
+    /** Micrometer 1.1.x Prometheus 暴露层清理适配器。 */
+    private volatile DruidPrometheusCollectorCleanup collectorCleanup;
     /** 单线程、有界队列的 SQL 映射落盘执行器。 */
     private volatile ThreadPoolExecutor mappingExecutor;
     /** 容器工厂（用于反查 DataSource Bean 名）；非 ListableBeanFactory 时为 null。 */
@@ -179,6 +181,8 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         if (meterRegistry == null) {
             return;
         }
+        collectorCleanup = new DruidPrometheusCollectorCleanup(meterRegistry);
+        collectorCleanup.logBinding("init");
         meterCleanup.updateInterval(config.getEvents().getCleanup().getIntervalHours());
         int queueSize = Math.max(1, config.getSqlMapping().getQueueSize());
         // 单线程 + 有界队列 + 拒绝即抛 AbortPolicy，保证落盘不会无限堆积、也不会阻塞事件线程
@@ -381,6 +385,9 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
                 Map.Entry<Meter.Id, Meter> entry = retryIt.next();
                 try {
                     meterRegistry.remove(entry.getValue());
+                    if (!removePrometheusCollector(entry.getValue())) {
+                        throw new IllegalStateException("Prometheus collector cleanup incomplete for " + entry.getKey());
+                    }
                     retryIt.remove();
                     retrySuccess++;
                     // 记录上周期失败 Meter 的重试成功结果。
@@ -423,6 +430,10 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
 
         DruidPrometheusMeterCleanup.CleanupCounts counts = new DruidPrometheusMeterCleanup.CleanupCounts(sqlBefore, uriBefore,
                 sqlSuccess, sqlFailed, uriSuccess, uriFailed, retrySuccess, retryFailed);
+        DruidPrometheusCollectorCleanup cleanup = collectorCleanup;
+        if (cleanup != null) {
+            cleanup.logBinding("cleanup");
+        }
         // 汇总本周期 SQL、URI 和失败重试的注销结果。
         if (DETAIL_LOG.isTraceEnabled()) {
             DETAIL_LOG.trace("druid detail meter cleanup: action=finish sqlBefore={} uriBefore={} sqlSuccess={} "
@@ -503,6 +514,9 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         }
         try {
             meterRegistry.remove(meter);
+            if (!removePrometheusCollector(meter)) {
+                throw new IllegalStateException("Prometheus collector cleanup incomplete for " + meter.getId());
+            }
             failedRemovals.remove(meter.getId(), meter);
             // 记录单个 Meter 的正常注销来源和结果。
             if (DETAIL_LOG.isTraceEnabled()) {
@@ -520,6 +534,12 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             }
             return false;
         }
+    }
+
+    /** 同步清理 Prometheus 暴露层；非 Prometheus Registry 无需额外处理。 */
+    private boolean removePrometheusCollector(Meter meter) {
+        DruidPrometheusCollectorCleanup cleanup = collectorCleanup;
+        return cleanup == null || cleanup.remove(meter);
     }
 
     /**

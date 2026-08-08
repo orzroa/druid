@@ -20,6 +20,8 @@
 
 实现不得调用 Druid 的 `reset-all`、`getValueAndReset()` 或其他修改 Druid 原生 Stat 的 API。清理按一期定义的 7 个精确 Meter 名称扫描 registry，不使用宽泛名称前缀；这些名称属于本模块保留的明细指标命名空间。不能只依赖 Listener 的本地 identity/ownership 索引，否则索引淘汰或注销异常后会留下无法再次发现的孤儿 Meter。
 
+同样不得调用 `CollectorRegistry.clear()`，也不得遍历清空应用的 `MeterRegistry`。Starter 使用的是 Spring 容器中已有的应用级 `MeterRegistry`，并非 Druid 私有 Registry；其中可能同时包含 JVM、Spring、HTTP 和业务指标。Prometheus 的一个 metric family 还会包含多个不同标签组合，注销整个 family 会误删未被 LRU 淘汰的其他 SQL/URI 序列。
+
 ## 触发模型
 
 本方案不创建定时任务、`TaskScheduler`、后台线程或轮询任务。清理由一期 listener 收到 SQL/URI 事件时顺带判断并触发。清理周期由配置项 `events.cleanup.interval-hours` 决定，记为整数 `n`：
@@ -65,12 +67,12 @@ spring.datasource.druid.prometheus.events.cleanup.interval-hours=6
 
 1. 普通事件在查找、创建和更新一期明细 Meter 的整个临界段持有读锁。
 2. 事件初步发现当前时间已到缓存清理点时申请写锁；取得写锁后必须重新读取当前时间、当前周期和缓存清理点，防止动态刷新混用新旧配置或多个并发事件重复清理。
-3. 确认需要清理后，扫描 `MeterRegistry` 并按 7 个精确名称逐个注销一期 SQL/URI 明细 Meter。
-4. 清空 SQL/URI identity 表、近似 LRU 元数据和 PENDING 状态，使旧对象不再被 Starter 强引用。注销失败的 Meter 仅保留准确句柄供下一个清理周期重试，不保留其 identity/LRU 状态。
+3. 确认需要清理后，扫描 `MeterRegistry` 并按 7 个精确名称逐个注销一期 SQL/URI 明细 Meter；使用 Micrometer 1.1.0 的 Prometheus Registry 时，还必须同步删除 Prometheus 暴露层中该 Meter 对应的 collector child。
+4. 清空 SQL/URI identity 表、近似 LRU 元数据和 PENDING 状态，使旧对象不再被 Starter 强引用。任一层清理失败的 Meter 仅保留准确句柄供下一个清理周期重试，不保留其 identity/LRU 状态。
 5. 本地状态释放完成后，更新最近清理基准和下一个固定清理点，然后释放写锁。
 6. 触发清理的当前事件重新进入一期正常记录流程，按需注册新 Meter，并成为新区间的第一条观测。
 
-清理期间到达的其他事件只等待写锁，不允许并发更新即将注销的 Meter。单个 Meter 注销失败时记录限频 `WARN` 并继续清理其他 Meter；无论 registry 注销结果如何，都必须记录本次清理完成时间，避免每条后续事件反复触发整批清理。注销失败的 Meter 保留准确句柄，并在下一个清理周期重试。下一次事件仍按正常流程获取或注册对应 Meter。
+清理期间到达的其他事件只等待写锁，不允许并发更新即将注销的 Meter。单个 Meter 在 Micrometer 层或 Prometheus 暴露层清理失败时记录限频 `WARN` 并继续清理其他 Meter；无论清理结果如何，都必须记录本次清理完成时间，避免每条后续事件反复触发整批清理。失败 Meter 保留准确句柄，并在下一个清理周期先行重试；重试完成后才重新取得 Registry 快照，避免同一 Meter 成功重试后又被重复扫描和计数。下一次事件仍按正常流程获取或注册对应 Meter。
 
 清理完成后输出一条组件业务日志，用于事后检查清理是否按预期执行以及清理了多少存量对象。触发来源解析、日志格式化和日志输出均在释放清理写锁后执行，避免延长事件阻塞时间。日志至少包含以下字段：
 
@@ -96,9 +98,65 @@ logging.level.druid.prometheus.detail=TRACE
 
 TRACE 仅用于短时故障定位；它会为每次指标操作产生业务日志，不建议在高流量生产环境长期启用。Prometheus/Actuator 对 Registry 的抓取由 Micrometer 执行，不经过 Listener，因此这里的“查询”指 Listener identity 查询和清理时的 Registry 扫描，不包含每次 scrape 对 Meter 的读取。
 
+## Micrometer 1.1.0 与 simpleclient 暴露层清理
+
+### 实际绑定关系
+
+当前 Starter 不创建独立 Registry。`DruidPrometheusMetricsListener` 通过 `ObjectProvider<MeterRegistry>` 获取 Spring 容器中的应用级 Registry；它可能是 `PrometheusMeterRegistry`，也可能是包含 Prometheus 子 Registry 的 `CompositeMeterRegistry`。
+
+Micrometer 1.1.0 和 `simpleclient_spring_boot` 0.5.0 的关系如下：
+
+1. `PrometheusMeterRegistry(PrometheusConfig)` 会创建一个新的 `CollectorRegistry`。
+2. `PrometheusMeterRegistry(PrometheusConfig, CollectorRegistry, Clock)` 使用调用方传入的 `CollectorRegistry`。
+3. `simpleclient_spring_boot` 0.5.0 创建的 `PrometheusEndpoint` 固定暴露 `CollectorRegistry.defaultRegistry`。
+4. 因此，只有 Micrometer 的 Prometheus Registry 显式绑定到 `CollectorRegistry.defaultRegistry` 时，Druid 写入的指标和 `/admin/prometheus` 才处于同一条暴露链；若应用注入的是 `CompositeMeterRegistry`，必须检查其中实际的 Prometheus 子 Registry。
+
+初始化和每次清理完成后，`druid.prometheus.detail=TRACE` 会输出诊断日志，包含：
+
+- `meterRegistryType`、`meterRegistryIdentity`；
+- `collectorRegistryType`、`collectorRegistryIdentity`；
+- `simpleclient` 默认 Registry 的 identity；
+- `sharedWithSimpleclientDefault`；
+- Micrometer 绑定 Registry 和默认 Registry 当前各自暴露的 Druid metric family。
+
+`sharedWithSimpleclientDefault=true` 表示清理目标与 `/admin/prometheus` 是同一个 CollectorRegistry。若为 `false`，必须先检查应用的 Registry 装配：清理 Micrometer 所绑定的独立 CollectorRegistry，不会删除 `PrometheusMvcEndpoint` 所暴露的默认 Registry 中的旧数据。禁止用 `CollectorRegistry.clear()` 掩盖绑定错误。
+
+### `MeterRegistry.remove()` 后 endpoint 仍有旧指标的原因
+
+Micrometer 1.1.0 的 `MeterRegistry.remove(meter)` 只从 Micrometer 的 `meterMap` 删除 Meter。`PrometheusMeterRegistry` 还会按 metric family 把采样 child 保存在私有的 `collectorMap -> MicrometerCollector.children` 中；1.1.0 没有在 `remove()` 时同步删除这个 child，也没有提供公开的单 child 删除 API。
+
+因此会出现以下现象：
+
+- `meterRegistry.getMeters().size()` 已经下降，甚至只剩少量非 Druid Meter；
+- Starter 的 `sqlStates.size()`、`uriMeters.size()` 已经下降或清零；
+- `/admin/prometheus` 仍然输出旧的 `druid_sql_*`、`druid_uri_*` label set。
+
+这些 size 只代表 Micrometer 逻辑层或 Starter 本地缓存，不代表 simpleclient CollectorRegistry 的最终暴露内容。该问题不是 Prometheus 抓取缓存，也不是 endpoint 转换组件重新创建指标，而是 Micrometer 1.1.0 的暴露层 child 没有随 Meter 删除。
+
+### 精确清理实现
+
+清理按以下顺序执行：
+
+1. 使用公开 API `MeterRegistry.remove(meter)` 删除 Micrometer 逻辑层 Meter。
+2. 若是 `CompositeMeterRegistry`，定位实际 Prometheus 子 Registry，并通过公开 API 删除子 Registry 中对应的实际 Meter。
+3. 使用 Registry 当前配置的公开 `NamingConvention` 计算 collectorMap key，不能手写点号转下划线或 Timer `_seconds` 规则。
+4. 由于 Micrometer 1.1.0 没有公开的 child 删除 API，版本适配器反射读取 `PrometheusMeterRegistry.collectorMap` 和 `MicrometerCollector.children`，按捕获的 Meter 实例或相同 `Meter.Id` 精确定位并删除一个 child。
+5. 不注销仍有其他 child 的 metric family，避免误删其他 SQL/URI 标签组合。最后一个 child 删除后保留固定数量的空 `MicrometerCollector`；1.1.0 的空 collector `collect()` 返回空列表，不会出现在 scrape 中，后续同名 Meter 还能安全复用它。该对象数量最多等于一期固定的 7 个 metric family，不随 SQL/URI identity 数增长。
+6. Prometheus child 清理失败视为本次 Meter 清理失败，准确句柄进入 `failedRemovals`，下一个清理周期继续重试；不得把“Micrometer remove 成功、暴露层 remove 失败”记录为整体成功。
+
+反射代码集中封装在 `DruidPrometheusCollectorCleanup`，生产代码仍只编译依赖可选的 `micrometer-core`，不强制应用引入 Prometheus 实现。`micrometer-registry-prometheus`、`simpleclient` 和 `simpleclient_spring_boot` 仅作为测试依赖用于锁定 1.1.0/0.5.0 行为。升级 Micrometer 后必须重新验证 `collectorMap`、`children` 和 child 捕获字段布局；布局不兼容时适配器记录带 `micrometerVersionRisk` 的告警并将句柄保留重试，不得静默报告清理成功。
+
+禁止采用以下替代方案：
+
+- `CollectorRegistry.clear()`：会删除同一 Registry 中 JVM、Spring 和业务 Collector；
+- 清空或遍历删除应用 `MeterRegistry` 的全部 Meter：Druid 不拥有该 Registry；
+- 直接注销整个 Druid metric family：LRU 只淘汰一个 identity 时会同时删除其他有效 label set；
+- 只执行 `sqlStates.clear()` / `uriMeters.clear()`：这只释放 Starter 本地索引，不会删除 Micrometer Meter 和 Prometheus child；
+- 单独为 Druid `new PrometheusMeterRegistry` 但不改 endpoint：新 Registry 默认使用独立 CollectorRegistry，现有 `/admin/prometheus` 不会暴露其中的数据。若未来采用独立 Registry，必须同时设计独立 endpoint 或合并 scrape，并重新处理公共 tags、NamingConvention、MeterFilter 和 Composite 后端。
+
 ## Prometheus 时间序列语义
 
-成功注销后，一期 Timer 的 `_count`、`_sum`，DistributionSummary 的 `_count`、`_sum` 以及窗口 `_max` 会在相同 label 的 Meter 被重新注册后从新周期开始。Prometheus 应将其视为一次受控的 counter reset；已抓取的历史样本不会被删除。注销失败的 Meter 会继续复用原有实例并保留累计值，不会在本次清理中 reset；待后续清理周期成功注销并重新注册后才发生 reset。
+成功注销后，一期 Timer 的 `_count`、`_sum`，DistributionSummary 的 `_count`、`_sum` 以及窗口 `_max` 会在相同 label 的 Meter 被重新注册后从新周期开始。Prometheus 应将其视为一次受控的 counter reset；已抓取的历史样本不会被删除。若 `MeterRegistry.remove()` 本身失败，后续注册仍会取得原实例并保留累计值。若 Micrometer 删除成功但 Prometheus child 同步失败，旧 child 可能在重试成功前继续暴露；该情况会记录告警并保留旧 Meter 句柄，不能按成功 reset 解释。
 
 一期看板和告警必须使用 `rate()` / `increase()` 处理 counter reset，范围向量至少覆盖两次 scrape，避免直接对单点累计值设置绝对阈值。跨区间趋势由 Prometheus 历史数据或 recording rule 提供，不能依赖 JVM 内一期 Meter 的进程累计值。清理和重新注册之间可能恰好发生一次 scrape，届时相关 series 会短暂缺失；告警应设置与 scrape 周期匹配的 `for` 或缺失容忍，避免清理窗口误报。
 
@@ -126,6 +184,9 @@ TRACE 仅用于短时故障定位；它会为每次指标操作产生业务日�
 8. 验证开关和 `interval-hours` 动态刷新：`prometheus.enabled=false` 或 `events.enabled=false` 时既不记录事件也不触发清理，重新启用后下一条有效事件按已有固定清理点判断；`interval-hours` 从合法变到 `<=0` 时立即停止清理，从 `<=0` 恢复到 `1..23` 或 `>=24` 时按已有基准重新计算固定清理点，若基准尚未建立则由下一条事件初始化且不立即清理；`n` 在 `1..23` 与 `>=24` 之间切换时，按新语义立即作用于下一条事件。
 9. 验证一期 counter reset 后 Prometheus `rate()` / `increase()` 查询保持合理，清理窗口的 series 短暂缺失不会触发误报。
 10. 验证清理完成后输出一条组件业务日志，包含业务日期、时区、触发原因（`cross-day`/`new-interval`）、固定清理点、区间序号、`interval-hours`、开始/完成时间、耗时、清理前 SQL/URI identity 数、成功/失败注销数、触发事件类型，以及 SQL 事件的数据源名或 URI 事件的已解析 URI 模板；日志不得写入结构化事件 logger，也不得包含 SQL 或 SQL MD5。事后可通过该日志核对每次清理是否按时触发、清理了多少存量对象。
+11. 使用 Micrometer Prometheus 1.1.0 验证“创建 Druid Meter → scrape 可见 → 删除 Meter 和 collector child → scrape 不再可见”，并确认同一 Registry 中的非 Druid Collector 仍然存在。
+12. 使用 `simpleclient_spring_boot` 0.5.0 的实际 `PrometheusMvcEndpoint` 和 `CollectorRegistry.defaultRegistry` 验证 `/admin/prometheus` 暴露链，而不只验证 `PrometheusMeterRegistry.scrape()`。
+13. 验证 `CompositeMeterRegistry`、自定义 `NamingConvention`、同 family 多标签 LRU 淘汰及 family 清空后重新注册：只能删除被淘汰 label set，其他 SQL/URI 标签必须继续暴露。
 
 ## 已接受的影响
 
