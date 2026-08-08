@@ -45,7 +45,6 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -421,10 +420,10 @@ public class DruidMeterCleanupTest {
         assertEquals(1L, timer1.count());
     }
 
-    // ==================== P1: 预注册同 ID 外部 Meter 清理后仍存在 ====================
+    // ==================== P1: 预注册同 ID 明细 Meter 也必须清理 ====================
 
     @Test
-    public void cleanup_doesNotRemoveExternallyPreRegisteredMeter() {
+    public void cleanup_removesExternallyPreRegisteredDetailMeter() {
         MutableClock clock = new MutableClock(Instant.parse("2026-08-07T10:00:00Z"), ZoneOffset.UTC);
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
         DruidPrometheusMetricsListener listener = newListener(cleanupConfig(3), registry, clock);
@@ -437,18 +436,39 @@ public class DruidMeterCleanupTest {
         io.micrometer.core.instrument.Timer externalTimer = io.micrometer.core.instrument.Timer
                 .builder("druid.sql.execution.duration").tags(externalTags).register(registry);
 
-        // listener 事件触发时会复用这个外部 Timer（registerTimer 检测到已存在不放入 ownedMeters）
+        // listener 事件触发时会复用这个预注册 Timer。
         listener.onSqlExecute("select 1", dataSource("primary"), 100L, null);
 
         // 跨区间触发清理
         clock.setInstant(Instant.parse("2026-08-07T12:05:00Z"));
         listener.onSqlExecute("select 2", dataSource("primary"), 100L, null);
 
-        // 外部预注册的 Timer 不应被清理删除
+        // 周期清理按 Druid 明细指标命名空间扫描，预注册的同 ID Timer 也必须删除，
+        // 否则它会在本地 identity 清空后成为永不回收的孤儿序列。
         io.micrometer.core.instrument.Timer timerAfter = registry.find("druid.sql.execution.duration")
                 .tags("sql", hash1, "datasource", "primary").timer();
-        assertNotNull(timerAfter);
-        assertSame(externalTimer, timerAfter);
+        assertNull(timerAfter);
+    }
+
+    @Test
+    public void cleanup_removesExternallyPreRegisteredUriDetailMeter() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-08-07T10:00:00Z"), ZoneOffset.UTC);
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        DruidPrometheusMetricsListener listener = newListener(cleanupConfig(3), registry, clock);
+        listener.init();
+
+        String uri = "/system/userlogin/queryuserinfo";
+        io.micrometer.core.instrument.Timer.builder("druid.uri.request.duration")
+                .tag("uri", uri).register(registry);
+        listener.onWebRequest(request(uri, null), uri, 100L, 0, 0, 0, null);
+
+        clock.setInstant(Instant.parse("2026-08-07T12:05:00Z"));
+        listener.onWebRequest(request("/admin/health", null), "/admin/health", 100L, 0, 0, 0, null);
+
+        assertNull(registry.find("druid.uri.request.duration").tag("uri", uri).timer());
+        assertNull(registry.find("druid.uri.jdbc.executions").tag("uri", uri).summary());
+        assertNull(registry.find("druid.uri.jdbc.affected.rows").tag("uri", uri).summary());
+        assertNull(registry.find("druid.uri.jdbc.fetched.rows").tag("uri", uri).summary());
     }
 
     // ==================== 触发事件清理后正常注册 ====================

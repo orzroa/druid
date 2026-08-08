@@ -17,6 +17,8 @@ package com.alibaba.druid.spring.boot.autoconfigure.stat;
 
 import com.alibaba.druid.proxy.jdbc.DataSourceProxy;
 import io.micrometer.core.instrument.Meter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -35,6 +37,8 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * {@link Clock#millis()} 并做一次整数比较，不进行日期对象转换或临时对象分配。
  */
 final class DruidPrometheusMeterCleanup {
+    /** 明细指标排障日志；仅在 TRACE 级别下输出调度判定过程。 */
+    private static final Logger DETAIL_LOG = LoggerFactory.getLogger("druid.prometheus.detail");
     private static final java.util.logging.Logger LOG =
             java.util.logging.Logger.getLogger("druid.prometheus.cleanup");
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
@@ -93,6 +97,11 @@ final class DruidPrometheusMeterCleanup {
                     : nextCleanupBoundaryMillis(last, intervalHours);
         }
         schedule = new Schedule(intervalHours, nextCleanupAt);
+        // 输出配置变更后计算出的下一次清理时间，便于排查动态刷新。
+        if (DETAIL_LOG.isTraceEnabled()) {
+            DETAIL_LOG.trace("druid detail meter cleanup schedule: action=update intervalHours={} nextCleanupAtMillis={} lastCleanupAtMillis={}",
+                    intervalHours, nextCleanupAt, lastCleanupAtMillis);
+        }
     }
 
     void maybeCleanupSql(DataSourceProxy dataSource) {
@@ -107,11 +116,21 @@ final class DruidPrometheusMeterCleanup {
         Schedule current = schedule;
         int intervalHours = current.intervalHours;
         if (intervalHours <= 0) {
+            // 记录因清理开关关闭而跳过本次事件的原因。
+            if (DETAIL_LOG.isTraceEnabled()) {
+                DETAIL_LOG.trace("druid detail meter cleanup check: triggerType={} result=disabled intervalHours={}",
+                        triggerType, intervalHours);
+            }
             return;
         }
         long nowMillis = clock.millis();
         long nextCleanupAt = current.nextCleanupAtMillis;
         if (nextCleanupAt != BASELINE_UNINITIALIZED && nowMillis < nextCleanupAt) {
+            // 记录当前事件尚未到达清理边界，无需申请写锁。
+            if (DETAIL_LOG.isTraceEnabled()) {
+                DETAIL_LOG.trace("druid detail meter cleanup check: triggerType={} result=before-boundary nowMillis={} nextCleanupAtMillis={}",
+                        triggerType, nowMillis, nextCleanupAt);
+            }
             return;
         }
 
@@ -121,6 +140,11 @@ final class DruidPrometheusMeterCleanup {
             current = schedule;
             intervalHours = current.intervalHours;
             if (intervalHours <= 0) {
+                // 写锁等待期间配置可能被刷新，再次确认清理仍处于关闭状态。
+                if (DETAIL_LOG.isTraceEnabled()) {
+                    DETAIL_LOG.trace("druid detail meter cleanup check: triggerType={} result=disabled-after-lock intervalHours={}",
+                            triggerType, intervalHours);
+                }
                 return;
             }
             nowMillis = clock.millis();
@@ -128,12 +152,27 @@ final class DruidPrometheusMeterCleanup {
             if (nextCleanupAt == BASELINE_UNINITIALIZED) {
                 lastCleanupAtMillis = nowMillis;
                 schedule = new Schedule(intervalHours, nextCleanupBoundaryMillis(nowMillis, intervalHours));
+                // 首个事件只建立时间基准，不执行历史 Meter 清理。
+                if (DETAIL_LOG.isTraceEnabled()) {
+                    DETAIL_LOG.trace("druid detail meter cleanup check: triggerType={} result=baseline-initialized nowMillis={} nextCleanupAtMillis={}",
+                            triggerType, nowMillis, schedule.nextCleanupAtMillis);
+                }
                 return;
             }
             if (nowMillis < nextCleanupAt) {
+                // 其他线程已在等待写锁期间完成清理，当前事件无需重复执行。
+                if (DETAIL_LOG.isTraceEnabled()) {
+                    DETAIL_LOG.trace("druid detail meter cleanup check: triggerType={} result=already-handled nowMillis={} nextCleanupAtMillis={}",
+                            triggerType, nowMillis, nextCleanupAt);
+                }
                 return;
             }
 
+            // 记录触发清理的边界和事件类型，便于定位调度是否符合预期。
+            if (DETAIL_LOG.isTraceEnabled()) {
+                DETAIL_LOG.trace("druid detail meter cleanup check: triggerType={} result=triggered nowMillis={} boundaryMillis={} intervalHours={}",
+                        triggerType, nowMillis, nextCleanupAt, intervalHours);
+            }
             long startNs = System.nanoTime();
             CleanupCounts counts = handler.cleanup();
             long finishedMillis = clock.millis();

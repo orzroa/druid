@@ -33,6 +33,7 @@ import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.test.context.support.TestPropertySourceUtils;
 
 import javax.servlet.http.HttpServletRequest;
 import javax.sql.DataSource;
@@ -49,7 +50,7 @@ import java.util.function.BooleanSupplier;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -477,14 +478,14 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
     }
 
     @Test
-    public void uriIdentityLimit_keepsExistingUriWhenNewMeterCreationFails() {
+    public void uriIdentityLimit_removesIncompleteUriGroupWhenCreationFails() {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
         DruidStatProperties.Prometheus config = defaultConfig(false);
         config.getEvents().setMaxUriIdentities(1);
         DruidPrometheusMetricsListener listener = newListener(config, registry, null);
         listener.init();
         listener.onWebRequest(request(null, ""), "/existing", 1L, 0, 0, 0, null);
-        Timer externalTimer = Timer.builder("druid.uri.request.duration").tag("uri", "/new").register(registry);
+        Timer.builder("druid.uri.request.duration").tag("uri", "/new").register(registry);
 
         registry.config().meterFilter(new MeterFilter() {
             @Override
@@ -507,9 +508,9 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
         });
         listener.onWebRequest(request(null, ""), "/new", 1L, 0, 0, 0, null);
 
-        assertEquals(2, registry.find("druid.uri.request.duration").meters().size());
+        assertEquals(1, registry.find("druid.uri.request.duration").meters().size());
         assertNotNull(registry.find("druid.uri.request.duration").tag("uri", "/existing").timer());
-        assertSame(externalTimer, registry.find("druid.uri.request.duration").tag("uri", "/new").timer());
+        assertNull(registry.find("druid.uri.request.duration").tag("uri", "/new").timer());
     }
 
     // ==================== 配置热刷新 ====================
@@ -635,6 +636,33 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
         context.refresh();
         try {
             assertTrue(context.containsBean("druidPrometheusMetricsListener"));
+        } finally {
+            context.close();
+        }
+    }
+
+    @Test
+    public void configuration_disabledAtStartupCanBeEnabledThroughRefresher() {
+        AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext();
+        TestPropertySourceUtils.addInlinedPropertiesToEnvironment(context,
+                "spring.datasource.druid.prometheus.enabled=false");
+        context.register(DisabledMetricsConfiguration.class, DruidPrometheusMetricsConfiguration.class);
+        context.refresh();
+        try {
+            DruidPrometheusMetricsListener listener = context.getBean(DruidPrometheusMetricsListener.class);
+            DruidPrometheusMetricsRefresher refresher = context.getBean(DruidPrometheusMetricsRefresher.class);
+            MeterRegistry registry = context.getBean(MeterRegistry.class);
+            DataSourceProxy dataSource = dataSource("primary");
+
+            listener.onSqlExecute("select 1", dataSource, 1L, null);
+            assertNull(registry.find("druid.sql.execution.duration").timer());
+
+            DruidStatProperties.Prometheus enabled = defaultConfig(false);
+            refresher.refresh(enabled);
+            listener.onSqlExecute("select 1", dataSource, 1L, null);
+
+            assertNotNull(registry.find("druid.sql.execution.duration")
+                    .tags("sql", hash("select 1"), "datasource", "primary").timer());
         } finally {
             context.close();
         }
@@ -769,6 +797,21 @@ public class DruidPrometheusMetricsListenerComprehensiveTest {
         @Bean
         public DruidStatProperties druidStatProperties() {
             return new DruidStatProperties();
+        }
+    }
+
+    @Configuration
+    static class DisabledMetricsConfiguration {
+        @Bean
+        public MeterRegistry meterRegistry() {
+            return new SimpleMeterRegistry();
+        }
+
+        @Bean
+        public DruidStatProperties druidStatProperties() {
+            DruidStatProperties properties = new DruidStatProperties();
+            properties.getPrometheus().setEnabled(false);
+            return properties;
         }
     }
 }

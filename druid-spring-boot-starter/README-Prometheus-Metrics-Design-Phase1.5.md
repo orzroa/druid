@@ -13,12 +13,12 @@
 以下内容不清理：
 
 - Druid 原生 SQL/URI Stat；
-- 应用或其他组件注册到 `MeterRegistry` 的 Meter；
+- 应用或其他组件注册到 `MeterRegistry` 的非 Druid 明细 Meter；
 - SQL mapping 文件及其异步写入线程；
 - Prometheus 已经抓取并保存的历史数据；
 - 后续二期的 `druid.agg.*` 聚合 Meter 和结构化事件日志。
 
-实现不得调用 Druid 的 `reset-all`、`getValueAndReset()` 或其他修改 Druid 原生 Stat 的 API，也不得按指标名称前缀扫描并删除 registry 中的 Meter。清理必须依据 Starter 保存的准确注册句柄执行，避免误删其他组件的指标。
+实现不得调用 Druid 的 `reset-all`、`getValueAndReset()` 或其他修改 Druid 原生 Stat 的 API。清理按一期定义的 7 个精确 Meter 名称扫描 registry，不使用宽泛名称前缀；这些名称属于本模块保留的明细指标命名空间。不能只依赖 Listener 的本地 identity/ownership 索引，否则索引淘汰或注销异常后会留下无法再次发现的孤儿 Meter。
 
 ## 触发模型
 
@@ -65,12 +65,12 @@ spring.datasource.druid.prometheus.events.cleanup.interval-hours=6
 
 1. 普通事件在查找、创建和更新一期明细 Meter 的整个临界段持有读锁。
 2. 事件初步发现当前时间已到缓存清理点时申请写锁；取得写锁后必须重新读取当前时间、当前周期和缓存清理点，防止动态刷新混用新旧配置或多个并发事件重复清理。
-3. 确认需要清理后，按 Starter 保存的注册句柄逐个从 `MeterRegistry` 注销一期 SQL/URI Meter；仅在确认注销成功后释放该 Meter 的所有权记录。
-4. 清空 SQL/URI identity 表、近似 LRU 元数据、已成功注销的注册句柄和 PENDING 状态，使旧对象不再被 Starter 强引用。注销失败的 Meter 仅保留准确注册句柄及所有权记录，供下一个清理周期重试，不保留其 identity/LRU 状态。
+3. 确认需要清理后，扫描 `MeterRegistry` 并按 7 个精确名称逐个注销一期 SQL/URI 明细 Meter。
+4. 清空 SQL/URI identity 表、近似 LRU 元数据和 PENDING 状态，使旧对象不再被 Starter 强引用。注销失败的 Meter 仅保留准确句柄供下一个清理周期重试，不保留其 identity/LRU 状态。
 5. 本地状态释放完成后，更新最近清理基准和下一个固定清理点，然后释放写锁。
 6. 触发清理的当前事件重新进入一期正常记录流程，按需注册新 Meter，并成为新区间的第一条观测。
 
-清理期间到达的其他事件只等待写锁，不允许并发更新即将注销的 Meter。单个 Meter 注销失败时记录限频 `WARN` 并继续清理其他 Meter；无论 registry 注销结果如何，都必须记录本次清理完成时间，避免每条后续事件反复触发整批清理。注销成功的 Meter 释放本地引用；注销失败的 Meter 保留准确注册句柄及所有权记录，并在下一个清理周期重试。下一次事件仍按正常流程获取或注册对应 Meter。
+清理期间到达的其他事件只等待写锁，不允许并发更新即将注销的 Meter。单个 Meter 注销失败时记录限频 `WARN` 并继续清理其他 Meter；无论 registry 注销结果如何，都必须记录本次清理完成时间，避免每条后续事件反复触发整批清理。注销失败的 Meter 保留准确句柄，并在下一个清理周期重试。下一次事件仍按正常流程获取或注册对应 Meter。
 
 清理完成后输出一条组件业务日志，用于事后检查清理是否按预期执行以及清理了多少存量对象。触发来源解析、日志格式化和日志输出均在释放清理写锁后执行，避免延长事件阻塞时间。日志至少包含以下字段：
 
@@ -87,6 +87,14 @@ spring.datasource.druid.prometheus.events.cleanup.interval-hours=6
 - 触发事件类型（`sql`/`uri`）和触发事件的数据源名（SQL 事件时）或已解析的 URI 模板（URI 事件时）
 
 该日志写入独立 logger（不得写入结构化事件 logger，也不得写入 Prometheus 抓取通道），默认级别 `INFO`；单个 Meter 注销失败的限频 `WARN` 与本日志分离输出。日志不得包含 SQL 或 SQL MD5。
+
+细粒度排障使用独立的 `druid.prometheus.detail` 业务 logger，默认关闭；将其设置为 `TRACE` 后，会记录每次 identity 查询命中/未命中、Meter 注册或复用、数值 record、LRU 淘汰、注册失败回滚、注销与失败重试、Registry 清理扫描，以及清理调度判断。TRACE 日志仅包含 Meter ID/tags、SQL MD5、数据源名、URI 模板和记录值，不包含 SQL 原文。Spring Boot 示例：
+
+```properties
+logging.level.druid.prometheus.detail=TRACE
+```
+
+TRACE 仅用于短时故障定位；它会为每次指标操作产生业务日志，不建议在高流量生产环境长期启用。Prometheus/Actuator 对 Registry 的抓取由 Micrometer 执行，不经过 Listener，因此这里的“查询”指 Listener identity 查询和清理时的 Registry 扫描，不包含每次 scrape 对 Meter 的读取。
 
 ## Prometheus 时间序列语义
 
@@ -111,10 +119,10 @@ spring.datasource.druid.prometheus.events.cleanup.interval-hours=6
 1. 验证清理基准初始未建立时，进程刚启动的首条事件不立即清理，仅初始化当前基准和下一个固定清理点；之后进入下一固定清理点后的首条事件才执行清理；跨自然日后首条事件也立即清理。同一固定清理点内的后续事件不重复清理。
 2. 使用可注入的 `Clock` 测试系统默认时区下的区间边界（如 `n=6` 时 06:00:00 的边界事件归属、11:59 → 12:00 跨区间）及跨日场景；生产代码不得通过散落的 `System.currentTimeMillis()` 判断时间。
 3. 验证 `n` 的取值边界：`n <= 0` 时事件路径不执行任何清理判断或操作，仅在启动读取配置或动态刷新为关闭状态时输出一次日志说明清理已关闭；`n >= 24` 时退化为每日清理一次，当日首条跨日事件清理后同日不再清理。
-4. 验证只注销 Starter 保存句柄对应的一期 SQL/URI Meter，并释放 identity、LRU、PENDING 引用及已成功注销 Meter 的注册句柄；注销失败的 Meter 继续保留准确注册句柄及所有权记录，不得影响 Druid 原生 Stat、SQL mapping、其他组件 Meter 或二期能力。
+4. 验证按 7 个精确名称注销 registry 中全部一期 SQL/URI 明细 Meter，并释放 identity、LRU、PENDING 引用；不得影响 Druid 原生 Stat、SQL mapping、其他名称的组件 Meter 或二期能力。
 5. 验证触发清理的当前事件在清理后正常注册并记录，清理前的事件不会在旧 Meter 上发生并发更新。
 6. 并发压测多个 SQL/URI 事件同时跨区间到达的场景，确保只清理一次，不发生漏清、双重注册、死锁或并发修改异常。
-7. 验证单个 Meter 注销失败时继续清理其他 Meter、保留失败 Meter 的准确注册句柄及所有权记录、记录限频 `WARN`，且同区间后续事件不会因失败反复执行整批清理；下一个清理周期会重试该 Meter。
+7. 验证单个 Meter 注销失败时继续清理其他 Meter、保留失败 Meter 的准确句柄供重试、记录限频 `WARN`，且同区间后续事件不会因失败反复执行整批清理；下一个清理周期会重试该 Meter。
 8. 验证开关和 `interval-hours` 动态刷新：`prometheus.enabled=false` 或 `events.enabled=false` 时既不记录事件也不触发清理，重新启用后下一条有效事件按已有固定清理点判断；`interval-hours` 从合法变到 `<=0` 时立即停止清理，从 `<=0` 恢复到 `1..23` 或 `>=24` 时按已有基准重新计算固定清理点，若基准尚未建立则由下一条事件初始化且不立即清理；`n` 在 `1..23` 与 `>=24` 之间切换时，按新语义立即作用于下一条事件。
 9. 验证一期 counter reset 后 Prometheus `rate()` / `increase()` 查询保持合理，清理窗口的 series 短暂缺失不会触发误报。
 10. 验证清理完成后输出一条组件业务日志，包含业务日期、时区、触发原因（`cross-day`/`new-interval`）、固定清理点、区间序号、`interval-hours`、开始/完成时间、耗时、清理前 SQL/URI identity 数、成功/失败注销数、触发事件类型，以及 SQL 事件的数据源名或 URI 事件的已解析 URI 模板；日志不得写入结构化事件 logger，也不得包含 SQL 或 SQL MD5。事后可通过该日志核对每次清理是否按时触发、清理了多少存量对象。

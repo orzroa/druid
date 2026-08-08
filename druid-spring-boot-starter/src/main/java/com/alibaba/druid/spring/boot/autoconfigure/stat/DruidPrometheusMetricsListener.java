@@ -26,6 +26,8 @@ import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.BeanFactory;
 import org.springframework.beans.factory.BeanFactoryAware;
@@ -47,6 +49,7 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -79,10 +82,19 @@ import java.util.concurrent.locks.Lock;
  */
 public final class DruidPrometheusMetricsListener implements StatFilterEventListener, WebStatEventListener,
         DruidPrometheusMetricsRefresher, BeanFactoryAware {
+    /** 明细指标排障日志；仅在 TRACE 级别下输出身份、Meter 和清理细节。 */
+    private static final Logger DETAIL_LOG = LoggerFactory.getLogger("druid.prometheus.detail");
     /** Spring MVC 在请求属性中存放“最佳匹配路径模板”的 key，例如 {@code /users/{id}}。 */
     private static final String SPRING_MVC_PATTERN_ATTRIBUTE =
             "org.springframework.web.servlet.HandlerMapping.bestMatchingPattern";
     private static final Duration DEFAULT_MAX_WINDOW = Duration.ofMinutes(2);
+    private static final String SQL_EXECUTION_DURATION = "druid.sql.execution.duration";
+    private static final String SQL_AFFECTED_ROWS = "druid.sql.affected.rows";
+    private static final String SQL_FETCHED_ROWS = "druid.sql.fetched.rows";
+    private static final String URI_REQUEST_DURATION = "druid.uri.request.duration";
+    private static final String URI_JDBC_EXECUTIONS = "druid.uri.jdbc.executions";
+    private static final String URI_JDBC_AFFECTED_ROWS = "druid.uri.jdbc.affected.rows";
+    private static final String URI_JDBC_FETCHED_ROWS = "druid.uri.jdbc.fetched.rows";
 
     /** 当前的 Prometheus 配置快照（运行时可被 {@link #refresh} 原子替换）。 */
     private volatile DruidStatProperties.Prometheus config;
@@ -98,8 +110,6 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     private final ConcurrentMap<String, SqlState> sqlStates = new ConcurrentHashMap<String, SqlState>();
     /** 以 URI 模板为 key 缓存的 URI 指标 Meter。 */
     private final ConcurrentMap<String, UriMeters> uriMeters = new ConcurrentHashMap<String, UriMeters>();
-    /** 仅记录由本 Listener 注册的 Meter，防止淘汰或失败回收误删其他生产者的同名 Meter。 */
-    private final ConcurrentMap<Meter.Id, Meter> ownedMeters = new ConcurrentHashMap<Meter.Id, Meter>();
     /** 注销失败的 Meter 句柄，下个清理周期重试。与 identity/LRU 解耦，避免拖累正常事件路径。 */
     private final ConcurrentMap<Meter.Id, Meter> failedRemovals = new ConcurrentHashMap<Meter.Id, Meter>();
     /** 仅序列注册/淘汰时使用，正常命中路径不获取此锁。 */
@@ -240,6 +250,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             SqlState state = sqlState(sql, dataSource);
             if (state != null && state.meters != null) {
                 state.meters.timer.record(durationNanos, TimeUnit.NANOSECONDS);
+                traceRecord(state.meters.timer, "sql-execute", durationNanos, "nanoseconds");
             }
         } finally {
             readLock.unlock();
@@ -262,6 +273,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             SqlState state = sqlState(sql, dataSource);
             if (updateCount >= 0 && state != null && state.meters != null) {
                 state.meters.affectedRows.record(updateCount);
+                traceRecord(state.meters.affectedRows, "sql-update-count", updateCount, "rows");
             }
         } finally {
             readLock.unlock();
@@ -284,6 +296,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             SqlState state = sqlState(sql, dataSource);
             if (state != null && state.meters != null) {
                 state.meters.fetchedRows.record(fetchRowCount);
+                traceRecord(state.meters.fetchedRows, "sql-resultset-close", fetchRowCount, "rows");
             }
         } finally {
             readLock.unlock();
@@ -314,9 +327,19 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
                 return;
             }
             meters.timer.record(durationNanos, TimeUnit.NANOSECONDS);
-            if (jdbcExecuteCount >= 0) meters.jdbcExecutions.record(jdbcExecuteCount);
-            if (jdbcUpdateCount >= 0) meters.jdbcAffectedRows.record(jdbcUpdateCount);
-            if (jdbcFetchRowCount >= 0) meters.jdbcFetchedRows.record(jdbcFetchRowCount);
+            traceRecord(meters.timer, "web-request", durationNanos, "nanoseconds");
+            if (jdbcExecuteCount >= 0) {
+                meters.jdbcExecutions.record(jdbcExecuteCount);
+                traceRecord(meters.jdbcExecutions, "web-jdbc-executions", jdbcExecuteCount, "count");
+            }
+            if (jdbcUpdateCount >= 0) {
+                meters.jdbcAffectedRows.record(jdbcUpdateCount);
+                traceRecord(meters.jdbcAffectedRows, "web-jdbc-affected-rows", jdbcUpdateCount, "rows");
+            }
+            if (jdbcFetchRowCount >= 0) {
+                meters.jdbcFetchedRows.record(jdbcFetchRowCount);
+                traceRecord(meters.jdbcFetchedRows, "web-jdbc-fetched-rows", jdbcFetchRowCount, "rows");
+            }
         } finally {
             readLock.unlock();
         }
@@ -329,15 +352,27 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         return meterRegistry != null && config.isEnabled() && config.getEvents().isEnabled();
     }
 
+    private void traceRecord(Meter meter, String source, long value, String unit) {
+        // 逐条事件记录值只用于短时排障，避免 INFO 日志干扰正常运行。
+        if (DETAIL_LOG.isTraceEnabled()) {
+            DETAIL_LOG.trace("druid detail meter update: action=record source={} meter={} value={} unit={}",
+                    source, meter.getId(), value, unit);
+        }
+    }
+
     /**
-     * 执行实际的清理：注销 Starter 持有的一期 SQL/URI 明细 Meter，清空 identity/LRU/句柄。
+     * 执行实际的清理：注销 Registry 中所有一期 SQL/URI 明细 Meter，清空 identity/LRU/句柄。
      * 调用方 {@link DruidPrometheusMeterCleanup} 持有写锁。
      * 始终移除 identity/LRU 状态；注销失败的单个 Meter 句柄存入 {@link #failedRemovals}，下周期重试。
+     * 不能只依赖本 Listener 的 identity 缓存：同名明细 Meter 可能在本 Listener 建立缓存前
+     * 就已存在，或者此前本地 identity 已淘汰；这两种情况都必须在周期清理时回收。
      */
     private DruidPrometheusMeterCleanup.CleanupCounts cleanupDetailMeters() {
-        int sqlBefore = sqlStates.size();
-        int uriBefore = uriMeters.size();
-
+        // 清理开始前记录本地缓存、重试队列和 Registry 的规模。
+        if (DETAIL_LOG.isTraceEnabled()) {
+            DETAIL_LOG.trace("druid detail meter cleanup: action=start registryMeters={} sqlStates={} uriStates={} pendingRetries={}",
+                    meterRegistry.getMeters().size(), sqlStates.size(), uriMeters.size(), failedRemovals.size());
+        }
         // 先重试上一周期注销失败的 Meter
         int retrySuccess = 0, retryFailed = 0;
         if (!failedRemovals.isEmpty()) {
@@ -348,55 +383,141 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
                     meterRegistry.remove(entry.getValue());
                     retryIt.remove();
                     retrySuccess++;
+                    // 记录上周期失败 Meter 的重试成功结果。
+                    if (DETAIL_LOG.isTraceEnabled()) {
+                        DETAIL_LOG.trace("druid detail meter delete: action=retry-remove result=success meter={}",
+                                entry.getKey());
+                    }
                 } catch (RuntimeException e) {
                     retryFailed++;
+                    // 记录重试失败原因；句柄会保留到下一个周期继续尝试。
+                    if (DETAIL_LOG.isTraceEnabled()) {
+                        DETAIL_LOG.trace("druid detail meter delete: action=retry-remove result=failed meter={} error={}",
+                                entry.getKey(), e.toString());
+                    }
                     // 保留在 failedRemovals 供下次重试
                 }
             }
         }
 
-        // 1. 注销 SQL Meter；始终移除 SqlState，失败 Meter 存入 failedRemovals
+        // 重试完成后再取 Registry 快照，避免同一个 Meter 被成功重试后又重复计数。
+        Map<Meter.Id, Meter> sqlMeters = new LinkedHashMap<Meter.Id, Meter>();
+        Map<Meter.Id, Meter> uriDetailMeters = new LinkedHashMap<Meter.Id, Meter>();
+        collectDetailMeters(sqlMeters, uriDetailMeters);
+        int sqlBefore = countSqlIdentities(sqlMeters);
+        int uriBefore = countUriIdentities(uriDetailMeters);
+
+        // 1. 注销 SQL Meter；扫描 Registry，不能遗漏不在本地 identity 缓存中的孤儿 Meter。
         int sqlSuccess = 0, sqlFailed = 0;
-        for (SqlState state : sqlStates.values()) {
-            if (state.meters == null) continue;
-            if (removeMeterOrDefer(state.meters.timer)) sqlSuccess++; else sqlFailed++;
-            if (removeMeterOrDefer(state.meters.affectedRows)) sqlSuccess++; else sqlFailed++;
-            if (removeMeterOrDefer(state.meters.fetchedRows)) sqlSuccess++; else sqlFailed++;
+        for (Meter meter : sqlMeters.values()) {
+            if (removeMeterOrDefer(meter, "periodic-cleanup")) sqlSuccess++; else sqlFailed++;
         }
         sqlStates.clear();
 
-        // 2. 注销 URI Meter；同样始终移除
+        // 2. 注销 URI Meter；同样扫描 Registry。
         int uriSuccess = 0, uriFailed = 0;
-        for (UriMeters meters : uriMeters.values()) {
-            if (removeMeterOrDefer(meters.timer)) uriSuccess++; else uriFailed++;
-            if (removeMeterOrDefer(meters.jdbcExecutions)) uriSuccess++; else uriFailed++;
-            if (removeMeterOrDefer(meters.jdbcAffectedRows)) uriSuccess++; else uriFailed++;
-            if (removeMeterOrDefer(meters.jdbcFetchedRows)) uriSuccess++; else uriFailed++;
+        for (Meter meter : uriDetailMeters.values()) {
+            if (removeMeterOrDefer(meter, "periodic-cleanup")) uriSuccess++; else uriFailed++;
         }
         uriMeters.clear();
 
-        return new DruidPrometheusMeterCleanup.CleanupCounts(sqlBefore, uriBefore,
+        DruidPrometheusMeterCleanup.CleanupCounts counts = new DruidPrometheusMeterCleanup.CleanupCounts(sqlBefore, uriBefore,
                 sqlSuccess, sqlFailed, uriSuccess, uriFailed, retrySuccess, retryFailed);
+        // 汇总本周期 SQL、URI 和失败重试的注销结果。
+        if (DETAIL_LOG.isTraceEnabled()) {
+            DETAIL_LOG.trace("druid detail meter cleanup: action=finish sqlBefore={} uriBefore={} sqlSuccess={} "
+                            + "sqlFailed={} uriSuccess={} uriFailed={} retrySuccess={} retryFailed={} registryMeters={}",
+                    sqlBefore, uriBefore, sqlSuccess, sqlFailed, uriSuccess, uriFailed,
+                    retrySuccess, retryFailed, meterRegistry.getMeters().size());
+        }
+        return counts;
+    }
+
+    /** 收集 Registry 中本模块全部高基数 SQL/URI 明细 Meter，按 ID 去重。 */
+    private void collectDetailMeters(Map<Meter.Id, Meter> sqlMeters, Map<Meter.Id, Meter> uriDetailMeters) {
+        for (Meter meter : meterRegistry.getMeters()) {
+            String name = meter.getId().getName();
+            if (isSqlDetailMeter(name)) {
+                sqlMeters.put(meter.getId(), meter);
+                // 输出扫描到的 SQL 明细 Meter，辅助排查孤儿序列。
+                if (DETAIL_LOG.isTraceEnabled()) {
+                    DETAIL_LOG.trace("druid detail meter query: action=cleanup-scan type=sql meter={}", meter.getId());
+                }
+            } else if (isUriDetailMeter(name)) {
+                uriDetailMeters.put(meter.getId(), meter);
+                // 输出扫描到的 URI 明细 Meter，辅助排查孤儿序列。
+                if (DETAIL_LOG.isTraceEnabled()) {
+                    DETAIL_LOG.trace("druid detail meter query: action=cleanup-scan type=uri meter={}", meter.getId());
+                }
+            }
+        }
+    }
+
+    private static boolean isSqlDetailMeter(String name) {
+        return SQL_EXECUTION_DURATION.equals(name)
+                || SQL_AFFECTED_ROWS.equals(name)
+                || SQL_FETCHED_ROWS.equals(name);
+    }
+
+    private static boolean isUriDetailMeter(String name) {
+        return URI_REQUEST_DURATION.equals(name)
+                || URI_JDBC_EXECUTIONS.equals(name)
+                || URI_JDBC_AFFECTED_ROWS.equals(name)
+                || URI_JDBC_FETCHED_ROWS.equals(name);
+    }
+
+    private static boolean isDetailMeter(String name) {
+        return isSqlDetailMeter(name) || isUriDetailMeter(name);
+    }
+
+    private static int countSqlIdentities(Map<Meter.Id, Meter> meters) {
+        Map<String, Boolean> identities = new LinkedHashMap<String, Boolean>();
+        for (Meter.Id id : meters.keySet()) {
+            identities.put(id.getTag("sql") + '\u0000' + id.getTag("datasource"), Boolean.TRUE);
+        }
+        return identities.size();
+    }
+
+    private static int countUriIdentities(Map<Meter.Id, Meter> meters) {
+        Map<String, Boolean> identities = new LinkedHashMap<String, Boolean>();
+        for (Meter.Id id : meters.keySet()) {
+            identities.put(id.getTag("uri"), Boolean.TRUE);
+        }
+        return identities.size();
     }
 
     /**
      * 注销单个 Meter；成功返回 true。失败时把句柄存入 {@link #failedRemovals} 供下周期重试，返回 false。
-     * 仅当 Meter 属于本 listener（即 {@link #ownedMeters} 中存在对应记录）时才调用 registry.remove；
-     * 外部组件预注册的同 ID Meter 不删除，仅清除本地 identity 引用（由调用方负责）。
+     * SQL/URI 明细 Meter 的命名空间由本模块管理，直接调用 registry.remove；注销失败时
+     * 保留句柄重试，避免留下无法发现的孤儿序列。
      */
-    private boolean removeMeterOrDefer(Meter meter) {
+    private boolean removeMeterOrDefer(Meter meter, String source) {
         if (meter == null) return true;
-        // 只有 ownedMeters.remove 成功才说明这个 Meter 归本 listener 管
-        if (!ownedMeters.remove(meter.getId(), meter)) {
-            // 不属于本 listener（外部预注册），不调用 registry.remove
+        if (!isDetailMeter(meter.getId().getName())) {
+            // 记录非本模块命名空间的 Meter 被保护性跳过。
+            if (DETAIL_LOG.isTraceEnabled()) {
+                DETAIL_LOG.trace("druid detail meter delete: action=remove result=skipped-not-detail source={} meter={}",
+                        source, meter.getId());
+            }
             return true;
         }
         try {
             meterRegistry.remove(meter);
+            failedRemovals.remove(meter.getId(), meter);
+            // 记录单个 Meter 的正常注销来源和结果。
+            if (DETAIL_LOG.isTraceEnabled()) {
+                DETAIL_LOG.trace("druid detail meter delete: action=remove result=success source={} meter={}",
+                        source, meter.getId());
+            }
             return true;
         } catch (RuntimeException e) {
             failedRemovals.put(meter.getId(), meter);
             meterCleanup.warnRemovalFailure(meter.getId(), e);
+            // 记录注销失败原因；后续周期将从失败队列重试。
+            if (DETAIL_LOG.isTraceEnabled()) {
+                DETAIL_LOG.trace("druid detail meter delete: action=remove result=failed source={} meter={} error={}",
+                        source, meter.getId(), e.toString());
+            }
             return false;
         }
     }
@@ -418,14 +539,29 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         String key = hash + '\u0000' + dataSourceName;
         SqlState current = sqlStates.get(key);
         if (current != null) {
+            // 记录 SQL identity 的无锁命中，便于分析缓存命中率。
+            if (DETAIL_LOG.isTraceEnabled()) {
+                DETAIL_LOG.trace("druid detail identity query: type=sql result=hit sql={} datasource={}",
+                        hash, dataSourceName);
+            }
             current.touch();
             trimSqlStatesIfNecessary();
             return current;
+        }
+        // 记录 SQL identity 的首次未命中，后续将尝试创建对应 Meter。
+        if (DETAIL_LOG.isTraceEnabled()) {
+            DETAIL_LOG.trace("druid detail identity query: type=sql result=miss sql={} datasource={}",
+                    hash, dataSourceName);
         }
         // 调用方已持有 meterCleanup 读锁，防止与清理写锁并发
         synchronized (sqlMeterLock) {
             current = sqlStates.get(key);
             if (current != null) {
+                // 记录等待建表锁期间被其他线程创建完成的命中。
+                if (DETAIL_LOG.isTraceEnabled()) {
+                    DETAIL_LOG.trace("druid detail identity query: type=sql result=hit-after-lock sql={} datasource={}",
+                            hash, dataSourceName);
+                }
                 current.touch();
                 trimSqlStates(maxSqlIdentities());
                 return current;
@@ -434,10 +570,20 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             try {
                 candidate.meters = createSqlMeters(candidate.hash, candidate.dataSource);
             } catch (RuntimeException e) {
+                // 记录 SQL Meter 注册失败，事件本身仍会被安全跳过。
+                if (DETAIL_LOG.isTraceEnabled()) {
+                    DETAIL_LOG.trace("druid detail identity add: type=sql result=failed sql={} datasource={} error={}",
+                            hash, dataSourceName, e.toString());
+                }
                 return null;
             }
             trimSqlStates(maxSqlIdentities() - 1);
             sqlStates.put(key, candidate);
+            // 记录 SQL identity 和整组 Meter 已成功加入缓存。
+            if (DETAIL_LOG.isTraceEnabled()) {
+                DETAIL_LOG.trace("druid detail identity add: type=sql result=success sql={} datasource={} size={}",
+                        hash, dataSourceName, sqlStates.size());
+            }
             submitMapping(candidate);
             return candidate;
         }
@@ -447,14 +593,26 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
     private UriMeters uriMeters(String template) {
         UriMeters meters = uriMeters.get(template);
         if (meters != null) {
+            // 记录 URI identity 的无锁命中，便于分析缓存命中率。
+            if (DETAIL_LOG.isTraceEnabled()) {
+                DETAIL_LOG.trace("druid detail identity query: type=uri result=hit uri={}", template);
+            }
             meters.touch();
             trimUriMetersIfNecessary();
             return meters;
+        }
+        // 记录 URI identity 的首次未命中，后续将尝试创建对应 Meter。
+        if (DETAIL_LOG.isTraceEnabled()) {
+            DETAIL_LOG.trace("druid detail identity query: type=uri result=miss uri={}", template);
         }
         // 调用方已持有 meterCleanup 读锁，防止与清理写锁并发
         synchronized (uriMeterLock) {
             meters = uriMeters.get(template);
             if (meters != null) {
+                // 记录等待建表锁期间被其他线程创建完成的命中。
+                if (DETAIL_LOG.isTraceEnabled()) {
+                    DETAIL_LOG.trace("druid detail identity query: type=uri result=hit-after-lock uri={}", template);
+                }
                 meters.touch();
                 trimUriMeters(maxUriIdentities());
                 return meters;
@@ -462,10 +620,20 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             try {
                 meters = createUriMeters(template);
             } catch (RuntimeException e) {
+                // 记录 URI Meter 注册失败，事件本身仍会被安全跳过。
+                if (DETAIL_LOG.isTraceEnabled()) {
+                    DETAIL_LOG.trace("druid detail identity add: type=uri result=failed uri={} error={}",
+                            template, e.toString());
+                }
                 return null;
             }
             trimUriMeters(maxUriIdentities() - 1);
             uriMeters.put(template, meters);
+            // 记录 URI identity 和整组 Meter 已成功加入缓存。
+            if (DETAIL_LOG.isTraceEnabled()) {
+                DETAIL_LOG.trace("druid detail identity add: type=uri result=success uri={} size={}",
+                        template, uriMeters.size());
+            }
             return meters;
         }
     }
@@ -517,20 +685,20 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         DistributionSummary affected = null;
         DistributionSummary fetched = null;
         try {
-            timer = registerTimer(Timer.builder("druid.sql.execution.duration")
+            timer = registerDetailTimer(Timer.builder(SQL_EXECUTION_DURATION)
                     .tags(tags).distributionStatisticExpiry(expiry)
-                    .distributionStatisticBufferLength(2), "druid.sql.execution.duration", tags);
-            affected = registerSummary(DistributionSummary.builder("druid.sql.affected.rows")
+                    .distributionStatisticBufferLength(2), SQL_EXECUTION_DURATION, tags);
+            affected = registerDetailSummary(DistributionSummary.builder(SQL_AFFECTED_ROWS)
                     .tags(tags).distributionStatisticExpiry(expiry)
-                    .distributionStatisticBufferLength(2), "druid.sql.affected.rows", tags);
-            fetched = registerSummary(DistributionSummary.builder("druid.sql.fetched.rows")
+                    .distributionStatisticBufferLength(2), SQL_AFFECTED_ROWS, tags);
+            fetched = registerDetailSummary(DistributionSummary.builder(SQL_FETCHED_ROWS)
                     .tags(tags).distributionStatisticExpiry(expiry)
-                    .distributionStatisticBufferLength(2), "druid.sql.fetched.rows", tags);
+                    .distributionStatisticBufferLength(2), SQL_FETCHED_ROWS, tags);
             return new SqlMeters(timer, affected, fetched);
         } catch (RuntimeException e) {
-            removeMeter(timer);
-            removeMeter(affected);
-            removeMeter(fetched);
+            removeMeterOrDefer(timer, "sql-registration-rollback");
+            removeMeterOrDefer(affected, "sql-registration-rollback");
+            removeMeterOrDefer(fetched, "sql-registration-rollback");
             throw e;
         }
     }
@@ -553,24 +721,24 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         DistributionSummary affectedRows = null;
         DistributionSummary fetchedRows = null;
         try {
-            timer = registerTimer(Timer.builder("druid.uri.request.duration").tags(tags)
+            timer = registerDetailTimer(Timer.builder(URI_REQUEST_DURATION).tags(tags)
                     .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2),
-                    "druid.uri.request.duration", tags);
-            executions = registerSummary(DistributionSummary.builder("druid.uri.jdbc.executions").tags(tags)
+                    URI_REQUEST_DURATION, tags);
+            executions = registerDetailSummary(DistributionSummary.builder(URI_JDBC_EXECUTIONS).tags(tags)
                     .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2),
-                    "druid.uri.jdbc.executions", tags);
-            affectedRows = registerSummary(DistributionSummary.builder("druid.uri.jdbc.affected.rows").tags(tags)
+                    URI_JDBC_EXECUTIONS, tags);
+            affectedRows = registerDetailSummary(DistributionSummary.builder(URI_JDBC_AFFECTED_ROWS).tags(tags)
                     .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2),
-                    "druid.uri.jdbc.affected.rows", tags);
-            fetchedRows = registerSummary(DistributionSummary.builder("druid.uri.jdbc.fetched.rows").tags(tags)
+                    URI_JDBC_AFFECTED_ROWS, tags);
+            fetchedRows = registerDetailSummary(DistributionSummary.builder(URI_JDBC_FETCHED_ROWS).tags(tags)
                     .distributionStatisticExpiry(expiry).distributionStatisticBufferLength(2),
-                    "druid.uri.jdbc.fetched.rows", tags);
+                    URI_JDBC_FETCHED_ROWS, tags);
             return new UriMeters(timer, executions, affectedRows, fetchedRows);
         } catch (RuntimeException e) {
-            removeMeter(timer);
-            removeMeter(executions);
-            removeMeter(affectedRows);
-            removeMeter(fetchedRows);
+            removeMeterOrDefer(timer, "uri-registration-rollback");
+            removeMeterOrDefer(executions, "uri-registration-rollback");
+            removeMeterOrDefer(affectedRows, "uri-registration-rollback");
+            removeMeterOrDefer(fetchedRows, "uri-registration-rollback");
             throw e;
         }
     }
@@ -785,6 +953,11 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             if (oldest == null || !sqlStates.remove(oldest.getKey(), oldest.getValue())) {
                 return;
             }
+            // 输出被近似 LRU 淘汰的 SQL identity，便于核对上限控制。
+            if (DETAIL_LOG.isTraceEnabled()) {
+                DETAIL_LOG.trace("druid detail identity delete: type=sql source=lru sql={} datasource={} sizeAfter={}",
+                        oldest.getValue().hash, oldest.getValue().dataSource, sqlStates.size());
+            }
             removeSqlMeters(oldest.getValue().meters);
         }
     }
@@ -795,6 +968,11 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             Map.Entry<String, UriMeters> oldest = oldestUriMeters();
             if (oldest == null || !uriMeters.remove(oldest.getKey(), oldest.getValue())) {
                 return;
+            }
+            // 输出被近似 LRU 淘汰的 URI identity，便于核对上限控制。
+            if (DETAIL_LOG.isTraceEnabled()) {
+                DETAIL_LOG.trace("druid detail identity delete: type=uri source=lru uri={} sizeAfter={}",
+                        oldest.getKey(), uriMeters.size());
             }
             removeUriMeters(oldest.getValue());
         }
@@ -820,47 +998,45 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         return oldest;
     }
 
-    private Timer registerTimer(Timer.Builder builder, String name, Tags tags) {
-        boolean existed = meterRegistry.find(name).tags(tags).meter() != null;
+    private Timer registerDetailTimer(Timer.Builder builder, String name, Tags tags) {
+        if (!isDetailMeter(name)) {
+            throw new IllegalArgumentException("not a Druid detail meter: " + name);
+        }
+        boolean existedBefore = meterRegistry.find(name).tags(tags).meter() != null;
         Timer meter = builder.register(meterRegistry);
-        if (!existed) {
-            ownedMeters.putIfAbsent(meter.getId(), meter);
+        // 记录 Timer 注册结果及是否复用了 Registry 中的同 ID Meter。
+        if (DETAIL_LOG.isTraceEnabled()) {
+            DETAIL_LOG.trace("druid detail meter add: action=register type=timer registryExistedBefore={} meter={}",
+                    existedBefore, meter.getId());
         }
         return meter;
     }
 
-    private DistributionSummary registerSummary(DistributionSummary.Builder builder, String name, Tags tags) {
-        boolean existed = meterRegistry.find(name).tags(tags).meter() != null;
+    private DistributionSummary registerDetailSummary(DistributionSummary.Builder builder, String name, Tags tags) {
+        if (!isDetailMeter(name)) {
+            throw new IllegalArgumentException("not a Druid detail meter: " + name);
+        }
+        boolean existedBefore = meterRegistry.find(name).tags(tags).meter() != null;
         DistributionSummary meter = builder.register(meterRegistry);
-        if (!existed) {
-            ownedMeters.putIfAbsent(meter.getId(), meter);
+        // 记录 Summary 注册结果及是否复用了 Registry 中的同 ID Meter。
+        if (DETAIL_LOG.isTraceEnabled()) {
+            DETAIL_LOG.trace("druid detail meter add: action=register type=summary registryExistedBefore={} meter={}",
+                    existedBefore, meter.getId());
         }
         return meter;
     }
 
     private void removeSqlMeters(SqlMeters meters) {
-        removeMeter(meters.timer);
-        removeMeter(meters.affectedRows);
-        removeMeter(meters.fetchedRows);
+        removeMeterOrDefer(meters.timer, "sql-lru");
+        removeMeterOrDefer(meters.affectedRows, "sql-lru");
+        removeMeterOrDefer(meters.fetchedRows, "sql-lru");
     }
 
     private void removeUriMeters(UriMeters meters) {
-        removeMeter(meters.timer);
-        removeMeter(meters.jdbcExecutions);
-        removeMeter(meters.jdbcAffectedRows);
-        removeMeter(meters.jdbcFetchedRows);
-    }
-
-    /** 仅回收本 Listener 注册的 Meter，回收异常不覆盖原始注册异常。 */
-    private void removeMeter(Meter meter) {
-        if (meter == null || !ownedMeters.remove(meter.getId(), meter)) {
-            return;
-        }
-        try {
-            meterRegistry.remove(meter);
-        } catch (RuntimeException ignored) {
-            // Meter 注册失败的错误不能影响业务事件路径。
-        }
+        removeMeterOrDefer(meters.timer, "uri-lru");
+        removeMeterOrDefer(meters.jdbcExecutions, "uri-lru");
+        removeMeterOrDefer(meters.jdbcAffectedRows, "uri-lru");
+        removeMeterOrDefer(meters.jdbcFetchedRows, "uri-lru");
     }
 
     /**

@@ -20,7 +20,6 @@ import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 
 /**
@@ -29,7 +28,6 @@ import org.springframework.context.annotation.Bean;
  * @author druid
  */
 @ConditionalOnClass(MeterRegistry.class)
-@ConditionalOnProperty(name = "spring.datasource.druid.prometheus.enabled", havingValue = "true", matchIfMissing = true)
 public class DruidPrometheusMetricsConfiguration {
     @Bean
     @ConditionalOnMissingBean
