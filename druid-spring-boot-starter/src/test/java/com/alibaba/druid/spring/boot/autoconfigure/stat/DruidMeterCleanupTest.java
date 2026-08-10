@@ -298,13 +298,13 @@ public class DruidMeterCleanupTest {
                         "datasource", "primary").timer());
     }
 
-    // ==================== P1-2: 部分 Meter 注销失败 ====================
+    // ==================== P1-2: 部分 Meter 注销失败且不保留重试句柄 ====================
 
     @Test
     public void cleanup_partialRemovalFailureStillClearsIdentityAndNewEventRebuilds() {
         // 用一个会针对 Timer 抛 remove 异常的 registry，验证：
         // 1. 清理后 SqlState 始终被移除（即使部分 Meter 注销失败）
-        // 2. 新事件重建 SqlState，成功注销的指标新建实例，失败的由 registry 返回旧实例
+        // 2. 不依赖失败句柄重试；新事件正常重建状态，下一周期重新扫描 Registry 即可删除旧 Meter
         MutableClock clock = new MutableClock(Instant.parse("2026-08-07T10:00:00Z"), ZoneOffset.UTC);
         FailingRemoveRegistry registry = new FailingRemoveRegistry();
         DruidPrometheusMetricsListener listener = newListener(cleanupConfig(3), registry, clock);
@@ -342,6 +342,12 @@ public class DruidMeterCleanupTest {
         assertNotNull(affected);
         assertEquals(1L, affected.count());
         assertEquals(3.0, affected.totalAmount(), 0.0);
+
+        // 进入下一个周期后，Registry 全量扫描会删除此前失败并被再次复用的 Timer。
+        clock.setInstant(Instant.parse("2026-08-07T15:05:00Z"));
+        listener.onSqlExecute("select 3", dataSource("primary"), 100L, null);
+        assertNull(registry.find("druid.sql.execution.duration")
+                .tags("sql", hash1, "datasource", "primary").timer());
     }
 
     // ==================== P1-1: 并发清理/记录不丢数据 ====================

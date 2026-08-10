@@ -17,6 +17,8 @@ package com.alibaba.druid.spring.boot.autoconfigure.stat;
 
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Tags;
+import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -26,9 +28,12 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Enumeration;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 清理 Micrometer Prometheus 1.1.x 暴露层中已经从 MeterRegistry 移除的明细序列。
@@ -43,6 +48,20 @@ final class DruidPrometheusCollectorCleanup {
     private static final Logger LOG = LoggerFactory.getLogger("druid.prometheus.detail");
     private static final String SQL_PREFIX = "druid_sql_";
     private static final String URI_PREFIX = "druid_uri_";
+    /** 一期固定的 7 个明细 Meter；周期清理不依赖本地状态或 Registry 快照推导 family。 */
+    private static final List<Meter.Id> DETAIL_METER_IDS;
+
+    static {
+        List<Meter.Id> ids = new ArrayList<Meter.Id>(7);
+        ids.add(detailId(DruidPrometheusMetricsListener.SQL_EXECUTION_DURATION, Meter.Type.TIMER));
+        ids.add(detailId(DruidPrometheusMetricsListener.SQL_AFFECTED_ROWS, Meter.Type.DISTRIBUTION_SUMMARY));
+        ids.add(detailId(DruidPrometheusMetricsListener.SQL_FETCHED_ROWS, Meter.Type.DISTRIBUTION_SUMMARY));
+        ids.add(detailId(DruidPrometheusMetricsListener.URI_REQUEST_DURATION, Meter.Type.TIMER));
+        ids.add(detailId(DruidPrometheusMetricsListener.URI_JDBC_EXECUTIONS, Meter.Type.DISTRIBUTION_SUMMARY));
+        ids.add(detailId(DruidPrometheusMetricsListener.URI_JDBC_AFFECTED_ROWS, Meter.Type.DISTRIBUTION_SUMMARY));
+        ids.add(detailId(DruidPrometheusMetricsListener.URI_JDBC_FETCHED_ROWS, Meter.Type.DISTRIBUTION_SUMMARY));
+        DETAIL_METER_IDS = Collections.unmodifiableList(ids);
+    }
 
     private final MeterRegistry meterRegistry;
     private volatile boolean bindingLogged;
@@ -97,7 +116,8 @@ final class DruidPrometheusCollectorCleanup {
             return true;
         }
         try {
-            return removeFromRegistry(meterRegistry, meter);
+            // 直接 Registry 使用调用方持有的 Meter，避免 LRU 热路径在 remove() 后再 O(N) 扫描。
+            return removeFromRegistry(meterRegistry, meter, false);
         } catch (Exception error) {
             LOG.warn("druid prometheus collector cleanup failed: family={} meter={} "
                             + "micrometerVersionRisk=reflection-layout-changed error={}",
@@ -106,12 +126,88 @@ final class DruidPrometheusCollectorCleanup {
         }
     }
 
-    private boolean removeFromRegistry(MeterRegistry registry, Meter target) throws Exception {
+    /** 周期清理固定清空一期 7 个 Prometheus family 的全部 child。 */
+    boolean clearAllDetailChildren() {
+        try {
+            Set<Collection<?>> children = Collections.newSetFromMap(
+                    new IdentityHashMap<Collection<?>, Boolean>());
+            collectChildren(meterRegistry, DETAIL_METER_IDS, children);
+            // 先完成全部反射解析，再统一修改，避免解析中途失败造成部分 family 已清空。
+            for (Collection<?> familyChildren : children) {
+                familyChildren.clear();
+            }
+            return true;
+        } catch (Exception error) {
+            LOG.error("druid prometheus collector family cleanup failed; periodic cleanup aborted: "
+                            + "meterRegistryType={} "
+                            + "micrometerVersionRisk=reflection-layout-changed error={}",
+                    meterRegistry.getClass().getName(), error.toString());
+            return false;
+        }
+    }
+
+    /**
+     * CompositeMeterRegistry.remove() 不保证注销所有子 Registry 的实际 Meter。
+     * family child 清空后通过 Micrometer 公开 API 扫描一次子 Registry 并同步注销，
+     * 避免后续注册复用一个已失去 Prometheus child 的旧 Meter。
+     */
+    boolean removeDetailMetersFromCompositeChildren() {
+        if (!(meterRegistry instanceof CompositeMeterRegistry)) {
+            return true;
+        }
+        try {
+            Set<MeterRegistry> visited = Collections.newSetFromMap(
+                    new IdentityHashMap<MeterRegistry, Boolean>());
+            for (MeterRegistry child : ((CompositeMeterRegistry) meterRegistry).getRegistries()) {
+                removeDetailMeters(child, visited);
+            }
+            return true;
+        } catch (RuntimeException error) {
+            LOG.error("druid micrometer composite child cleanup failed: meterRegistryType={} error={}",
+                    meterRegistry.getClass().getName(), error.toString());
+            return false;
+        }
+    }
+
+    private static Meter.Id detailId(String name, Meter.Type type) {
+        return new Meter.Id(name, Tags.empty(), null, null, type);
+    }
+
+    private void collectChildren(MeterRegistry registry, List<Meter.Id> ids,
+                                 Set<Collection<?>> children) throws Exception {
+        if (directPrometheusCollectorRegistry(registry) != null) {
+            Set<String> families = new HashSet<String>();
+            for (Meter.Id id : ids) {
+                families.add(conventionName(registry, id));
+            }
+            for (String family : families) {
+                Object collector = collectorFor(registry, family);
+                if (collector != null) {
+                    children.add(childrenOf(collector));
+                }
+            }
+            return;
+        }
+
+        if (!(registry instanceof CompositeMeterRegistry)) {
+            return;
+        }
+        for (MeterRegistry child : ((CompositeMeterRegistry) registry).getRegistries()) {
+            collectChildren(child, ids, children);
+        }
+    }
+
+    private boolean removeFromRegistry(MeterRegistry registry, Meter target,
+                                       boolean locateChildMeter) throws Exception {
         Object collectorRegistry = directPrometheusCollectorRegistry(registry);
         if (collectorRegistry != null) {
-            Meter actual = findMeter(registry, target);
-            if (actual == null) {
-                actual = target;
+            Meter actual = target;
+            if (locateChildMeter) {
+                actual = findMeter(registry, target);
+                if (actual == null) {
+                    // 子 Registry 已经不再持有 Meter 时，暴露层 child 仍可能存在；用目标 ID 继续定位。
+                    actual = target;
+                }
             }
             // collectorMap 的 key 由 Registry 的 NamingConvention 生成，不能手写下划线规则。
             String familyName = conventionName(registry, actual.getId());
@@ -120,7 +216,7 @@ final class DruidPrometheusCollectorCleanup {
                 return true;
             }
             // CompositeMeterRegistry 的 remove 不会移除子 Registry 中的实际 Meter，先通过公开 API 移除。
-            if (actual != target) {
+            if (locateChildMeter && actual != target) {
                 registry.remove(actual);
             }
             boolean removed = removeChild(collector, actual);
@@ -139,28 +235,37 @@ final class DruidPrometheusCollectorCleanup {
             return true;
         }
 
-        Method registriesMethod = findMethod(registry.getClass(), "getRegistries");
-        if (registriesMethod == null) {
+        if (!(registry instanceof CompositeMeterRegistry)) {
             // 普通 Simple/JMX 等 Registry 没有 Prometheus 暴露层，不需要额外同步。
-            return true;
-        }
-        Object registries = registriesMethod.invoke(registry);
-        if (!(registries instanceof Iterable)) {
             return true;
         }
         boolean found = false;
         boolean success = true;
-        for (Object child : (Iterable<?>) registries) {
-            if (child instanceof MeterRegistry) {
-                MeterRegistry childRegistry = (MeterRegistry) child;
-                if (directPrometheusCollectorRegistry(childRegistry) != null
-                        || findMethod(childRegistry.getClass(), "getRegistries") != null) {
-                    found = true;
-                    success &= removeFromRegistry(childRegistry, target);
-                }
+        for (MeterRegistry child : ((CompositeMeterRegistry) registry).getRegistries()) {
+            if (directPrometheusCollectorRegistry(child) != null
+                    || child instanceof CompositeMeterRegistry) {
+                found = true;
+                success &= removeFromRegistry(child, target, true);
             }
         }
         return !found || success;
+    }
+
+    private void removeDetailMeters(MeterRegistry registry, Set<MeterRegistry> visited) {
+        if (!visited.add(registry)) {
+            return;
+        }
+        // getMeters() 只扫描一次并复制，避免边遍历边注销引发实现相关行为。
+        for (Meter meter : new ArrayList<Meter>(registry.getMeters())) {
+            if (isDetailMeter(meter.getId().getName())) {
+                registry.remove(meter);
+            }
+        }
+        if (registry instanceof CompositeMeterRegistry) {
+            for (MeterRegistry child : ((CompositeMeterRegistry) registry).getRegistries()) {
+                removeDetailMeters(child, visited);
+            }
+        }
     }
 
     private Object prometheusCollectorRegistry() throws Exception {
@@ -168,20 +273,13 @@ final class DruidPrometheusCollectorCleanup {
         if (direct != null) {
             return direct;
         }
-        Method registriesMethod = findMethod(meterRegistry.getClass(), "getRegistries");
-        if (registriesMethod == null) {
+        if (!(meterRegistry instanceof CompositeMeterRegistry)) {
             return null;
         }
-        Object registries = registriesMethod.invoke(meterRegistry);
-        if (registries instanceof Iterable) {
-            for (Object child : (Iterable<?>) registries) {
-                if (child instanceof MeterRegistry) {
-                    Object nested = new DruidPrometheusCollectorCleanup((MeterRegistry) child)
-                            .prometheusCollectorRegistry();
-                    if (nested != null) {
-                        return nested;
-                    }
-                }
+        for (MeterRegistry child : ((CompositeMeterRegistry) meterRegistry).getRegistries()) {
+            Object nested = new DruidPrometheusCollectorCleanup(child).prometheusCollectorRegistry();
+            if (nested != null) {
+                return nested;
             }
         }
         return null;
@@ -322,6 +420,15 @@ final class DruidPrometheusCollectorCleanup {
 
     private static boolean isDruidMeter(String name) {
         return name != null && (name.startsWith("druid.sql.") || name.startsWith("druid.uri."));
+    }
+
+    private static boolean isDetailMeter(String name) {
+        for (Meter.Id id : DETAIL_METER_IDS) {
+            if (id.getName().equals(name)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean isDruidFamily(String name) {

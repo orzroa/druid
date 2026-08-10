@@ -197,7 +197,8 @@ final class DruidPrometheusMeterCleanup {
         long last = lastRemovalWarnMs.get();
         if (now - last >= 1000L && lastRemovalWarnMs.compareAndSet(last, now)) {
             LOG.warning("failed to remove meter " + id
-                    + ", deferred to next cleanup cycle: " + error.getMessage());
+                    + "; no per-meter retry is retained, the next periodic cleanup clears families and rescans registries: "
+                    + error.getMessage());
         }
     }
 
@@ -255,14 +256,16 @@ final class DruidPrometheusMeterCleanup {
                 + " started=" + started.format(TIME_FORMATTER)
                 + " finished=" + finished.format(TIME_FORMATTER)
                 + " elapsedMs=" + result.elapsedMs
-                + " sqlBefore=" + counts.sqlBefore
-                + " uriBefore=" + counts.uriBefore
-                + " sqlSuccess=" + counts.sqlSuccess
-                + " sqlFailed=" + counts.sqlFailed
-                + " uriSuccess=" + counts.uriSuccess
-                + " uriFailed=" + counts.uriFailed
-                + " retrySuccess=" + counts.retrySuccess
-                + " retryFailed=" + counts.retryFailed
+                + " familySuccess=" + counts.familySuccess
+                + " registryTreeSuccess=" + counts.registryTreeSuccess
+                + " sqlIdentityBefore=" + counts.sqlIdentityBefore
+                + " uriIdentityBefore=" + counts.uriIdentityBefore
+                + " sqlMeterBefore=" + counts.sqlMeterBefore
+                + " uriMeterBefore=" + counts.uriMeterBefore
+                + " sqlMeterSuccess=" + counts.sqlMeterSuccess
+                + " sqlMeterFailed=" + counts.sqlMeterFailed
+                + " uriMeterSuccess=" + counts.uriMeterSuccess
+                + " uriMeterFailed=" + counts.uriMeterFailed
                 + " triggerType=" + triggerType
                 + " triggerSource=" + triggerSource);
     }
@@ -274,25 +277,31 @@ final class DruidPrometheusMeterCleanup {
     }
 
     static final class CleanupCounts {
-        final int sqlBefore;
-        final int uriBefore;
-        final int sqlSuccess;
-        final int sqlFailed;
-        final int uriSuccess;
-        final int uriFailed;
-        final int retrySuccess;
-        final int retryFailed;
+        final boolean familySuccess;
+        final boolean registryTreeSuccess;
+        final int sqlIdentityBefore;
+        final int uriIdentityBefore;
+        final int sqlMeterBefore;
+        final int uriMeterBefore;
+        final int sqlMeterSuccess;
+        final int sqlMeterFailed;
+        final int uriMeterSuccess;
+        final int uriMeterFailed;
 
-        CleanupCounts(int sqlBefore, int uriBefore, int sqlSuccess, int sqlFailed,
-                      int uriSuccess, int uriFailed, int retrySuccess, int retryFailed) {
-            this.sqlBefore = sqlBefore;
-            this.uriBefore = uriBefore;
-            this.sqlSuccess = sqlSuccess;
-            this.sqlFailed = sqlFailed;
-            this.uriSuccess = uriSuccess;
-            this.uriFailed = uriFailed;
-            this.retrySuccess = retrySuccess;
-            this.retryFailed = retryFailed;
+        CleanupCounts(boolean familySuccess, boolean registryTreeSuccess,
+                      int sqlIdentityBefore, int uriIdentityBefore,
+                      int sqlMeterBefore, int uriMeterBefore, int sqlMeterSuccess,
+                      int sqlMeterFailed, int uriMeterSuccess, int uriMeterFailed) {
+            this.familySuccess = familySuccess;
+            this.registryTreeSuccess = registryTreeSuccess;
+            this.sqlIdentityBefore = sqlIdentityBefore;
+            this.uriIdentityBefore = uriIdentityBefore;
+            this.sqlMeterBefore = sqlMeterBefore;
+            this.uriMeterBefore = uriMeterBefore;
+            this.sqlMeterSuccess = sqlMeterSuccess;
+            this.sqlMeterFailed = sqlMeterFailed;
+            this.uriMeterSuccess = uriMeterSuccess;
+            this.uriMeterFailed = uriMeterFailed;
         }
     }
 

@@ -18,6 +18,7 @@ package com.alibaba.druid.spring.boot.autoconfigure.stat;
 import com.alibaba.druid.proxy.jdbc.DataSourceProxy;
 import com.alibaba.druid.spring.boot.autoconfigure.properties.DruidStatProperties;
 import io.micrometer.core.instrument.Clock;
+import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.config.NamingConvention;
 import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
@@ -44,6 +45,98 @@ import static org.mockito.Mockito.when;
 
 /** 验证 Micrometer 1.1.0 Prometheus 暴露层同步清理，不调用全局 CollectorRegistry.clear()。 */
 public class DruidPrometheusCollectorCleanupTest {
+    @Test
+    public void bulkClearRemovesOnlyRequestedDruidFamiliesAndAllowsRecreation() {
+        CollectorRegistry collectorRegistry = new CollectorRegistry();
+        PrometheusMeterRegistry meterRegistry = new PrometheusMeterRegistry(
+                PrometheusConfig.DEFAULT, collectorRegistry, Clock.SYSTEM);
+        Timer firstSql = Timer.builder("druid.sql.execution.duration")
+                .tag("sql", "first").tag("datasource", "primary").register(meterRegistry);
+        Timer secondSql = Timer.builder("druid.sql.execution.duration")
+                .tag("sql", "second").tag("datasource", "primary").register(meterRegistry);
+        Timer uri = Timer.builder("druid.uri.request.duration")
+                .tag("uri", "/bulk/{id}").register(meterRegistry);
+        DistributionSummary sqlAffected = DistributionSummary.builder("druid.sql.affected.rows")
+                .tag("sql", "first").tag("datasource", "primary").register(meterRegistry);
+        DistributionSummary sqlFetched = DistributionSummary.builder("druid.sql.fetched.rows")
+                .tag("sql", "first").tag("datasource", "primary").register(meterRegistry);
+        DistributionSummary uriExecutions = DistributionSummary.builder("druid.uri.jdbc.executions")
+                .tag("uri", "/bulk/{id}").register(meterRegistry);
+        DistributionSummary uriAffected = DistributionSummary.builder("druid.uri.jdbc.affected.rows")
+                .tag("uri", "/bulk/{id}").register(meterRegistry);
+        DistributionSummary uriFetched = DistributionSummary.builder("druid.uri.jdbc.fetched.rows")
+                .tag("uri", "/bulk/{id}").register(meterRegistry);
+        Timer application = Timer.builder("application.request.duration")
+                .tag("uri", "/health").register(meterRegistry);
+        firstSql.record(1, java.util.concurrent.TimeUnit.MILLISECONDS);
+        secondSql.record(1, java.util.concurrent.TimeUnit.MILLISECONDS);
+        uri.record(1, java.util.concurrent.TimeUnit.MILLISECONDS);
+        sqlAffected.record(1);
+        sqlFetched.record(1);
+        uriExecutions.record(1);
+        uriAffected.record(1);
+        uriFetched.record(1);
+        application.record(1, java.util.concurrent.TimeUnit.MILLISECONDS);
+
+        DruidPrometheusCollectorCleanup cleanup = new DruidPrometheusCollectorCleanup(meterRegistry);
+        assertTrue(cleanup.clearAllDetailChildren());
+        assertFalse(meterRegistry.scrape().contains("druid_sql_execution_duration"));
+        assertFalse(meterRegistry.scrape().contains("druid_sql_affected_rows"));
+        assertFalse(meterRegistry.scrape().contains("druid_sql_fetched_rows"));
+        assertFalse(meterRegistry.scrape().contains("druid_uri_request_duration"));
+        assertFalse(meterRegistry.scrape().contains("druid_uri_jdbc_executions"));
+        assertFalse(meterRegistry.scrape().contains("druid_uri_jdbc_affected_rows"));
+        assertFalse(meterRegistry.scrape().contains("druid_uri_jdbc_fetched_rows"));
+        assertTrue(meterRegistry.scrape().contains("application_request_duration"));
+
+        meterRegistry.remove(firstSql);
+        meterRegistry.remove(secondSql);
+        meterRegistry.remove(uri);
+        Timer recreated = Timer.builder("druid.sql.execution.duration")
+                .tag("sql", "recreated").tag("datasource", "primary").register(meterRegistry);
+        recreated.record(1, java.util.concurrent.TimeUnit.MILLISECONDS);
+        assertTrue(meterRegistry.scrape().contains("recreated"));
+    }
+
+    @Test
+    public void bulkClearRemovesOrphanChildAfterMeterWasAlreadyRemoved() {
+        CollectorRegistry collectorRegistry = new CollectorRegistry();
+        PrometheusMeterRegistry meterRegistry = new PrometheusMeterRegistry(
+                PrometheusConfig.DEFAULT, collectorRegistry, Clock.SYSTEM);
+        Timer timer = Timer.builder("druid.sql.execution.duration")
+                .tag("sql", "orphan").tag("datasource", "primary").register(meterRegistry);
+        timer.record(1, java.util.concurrent.TimeUnit.MILLISECONDS);
+
+        assertNotNull(meterRegistry.remove(timer));
+        assertTrue("Micrometer 1.1.0 remove 后 Prometheus child 应仍存在，测试前提不成立",
+                meterRegistry.scrape().contains("orphan"));
+
+        assertTrue(new DruidPrometheusCollectorCleanup(meterRegistry).clearAllDetailChildren());
+        assertFalse("固定 family 清理必须覆盖 Registry 快照中已不可见的孤儿 child",
+                meterRegistry.scrape().contains("orphan"));
+    }
+
+    @Test
+    public void bulkClearUsesConfiguredNamingConvention() {
+        CollectorRegistry collectorRegistry = new CollectorRegistry();
+        PrometheusMeterRegistry meterRegistry = new PrometheusMeterRegistry(
+                PrometheusConfig.DEFAULT, collectorRegistry, Clock.SYSTEM);
+        final NamingConvention delegate = meterRegistry.config().namingConvention();
+        meterRegistry.config().namingConvention(new NamingConvention() {
+            @Override
+            public String name(String name, Meter.Type type, String baseUnit) {
+                return "custom_" + delegate.name(name, type, baseUnit);
+            }
+        });
+        Timer timer = Timer.builder("druid.uri.request.duration")
+                .tag("uri", "/custom/bulk").register(meterRegistry);
+        timer.record(1, java.util.concurrent.TimeUnit.MILLISECONDS);
+        assertTrue(meterRegistry.scrape().contains("custom_druid_uri_request_duration"));
+
+        assertTrue(new DruidPrometheusCollectorCleanup(meterRegistry).clearAllDetailChildren());
+        assertFalse(meterRegistry.scrape().contains("custom_druid_uri_request_duration"));
+    }
+
     @Test
     public void removeDruidTimerRemovesPrometheusFamilyWithoutClearingOtherCollectors() {
         CollectorRegistry collectorRegistry = new CollectorRegistry();
@@ -143,6 +236,30 @@ public class DruidPrometheusCollectorCleanupTest {
         assertTrue(new DruidPrometheusCollectorCleanup(composite).remove(timer));
 
         assertFalse(prometheus.scrape().contains("druid_sql_execution_duration"));
+    }
+
+    @Test
+    public void periodicCleanupRemovesCompositeChildMeterAndAllowsRecreation() {
+        CollectorRegistry collectorRegistry = new CollectorRegistry();
+        PrometheusMeterRegistry prometheus = new PrometheusMeterRegistry(
+                PrometheusConfig.DEFAULT, collectorRegistry, Clock.SYSTEM);
+        CompositeMeterRegistry composite = new CompositeMeterRegistry();
+        composite.add(prometheus);
+        Timer timer = Timer.builder("druid.uri.request.duration")
+                .tag("uri", "/composite/periodic").register(composite);
+        timer.record(1, java.util.concurrent.TimeUnit.MILLISECONDS);
+        DruidPrometheusCollectorCleanup cleanup = new DruidPrometheusCollectorCleanup(composite);
+
+        assertTrue(cleanup.clearAllDetailChildren());
+        assertNotNull(composite.remove(timer));
+        assertTrue(cleanup.removeDetailMetersFromCompositeChildren());
+        assertNull(prometheus.find("druid.uri.request.duration")
+                .tag("uri", "/composite/periodic").timer());
+
+        Timer recreated = Timer.builder("druid.uri.request.duration")
+                .tag("uri", "/composite/periodic").register(composite);
+        recreated.record(1, java.util.concurrent.TimeUnit.MILLISECONDS);
+        assertTrue(prometheus.scrape().contains("/composite/periodic"));
     }
 
     @Test
