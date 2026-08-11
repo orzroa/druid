@@ -28,12 +28,9 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Enumeration;
-import java.util.HashSet;
-import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * 清理 Micrometer Prometheus 1.1.x 暴露层中已经从 MeterRegistry 移除的明细序列。
@@ -41,8 +38,13 @@ import java.util.Set;
  * <p>Micrometer 1.1.0 的 {@code PrometheusMeterRegistry} 将每个 Meter 的采样器
  * 保存在内部 {@code MicrometerCollector.children} 中，但 MeterRegistry.remove()
  * 没有同步移除该采样器。因此这里优先使用 Micrometer/Prometheus 的公开 API，
- * 仅在需要定位 collector child 时使用版本相关反射。反射失败时只记录告警，
+ * 仅在需要定位 collector child 时使用版本相关反射。反射失败时记录 WARN/ERROR，
  * 不影响 SQL/URI 事件主路径。</p>
+ *
+ * <p><strong>REMARK：</strong>当前固定部署由应用直接注入绑定
+ * {@code CollectorRegistry.defaultRegistry} 的 {@code PrometheusMeterRegistry}，
+ * 本适配器不再递归兼容 {@link CompositeMeterRegistry}。若未来 Registry 结构变化，
+ * 必须重新设计暴露层清理并通过真实 Prometheus endpoint E2E 后再启用。</p>
  */
 final class DruidPrometheusCollectorCleanup {
     private static final Logger LOG = LoggerFactory.getLogger("druid.prometheus.detail");
@@ -66,6 +68,7 @@ final class DruidPrometheusCollectorCleanup {
     private final MeterRegistry meterRegistry;
     private volatile boolean bindingLogged;
 
+    /** 创建绑定到应用实际 MeterRegistry 的 Prometheus 暴露层清理适配器。 */
     DruidPrometheusCollectorCleanup(MeterRegistry meterRegistry) {
         this.meterRegistry = meterRegistry;
     }
@@ -76,16 +79,18 @@ final class DruidPrometheusCollectorCleanup {
             return;
         }
         try {
-            Object collectorRegistry = prometheusCollectorRegistry();
+            Object collectorRegistry = directPrometheusCollectorRegistry(meterRegistry);
             Object defaultCollectorRegistry = simpleclientDefaultCollectorRegistry();
             if (collectorRegistry == null) {
                 if (!bindingLogged || "cleanup".equals(phase)) {
                     LOG.trace("druid prometheus registry: phase={} meterRegistryType={} "
                                     + "meterRegistryIdentity={} collectorRegistryType=unavailable "
                                     + "simpleclientDefaultIdentity={} defaultDruidFamilies={} "
-                                    + "detail=not-a-prometheus-registry",
+                                    + "detail={}",
                             phase, meterRegistry.getClass().getName(), System.identityHashCode(meterRegistry),
-                            identity(defaultCollectorRegistry), druidFamiliesOrEmpty(defaultCollectorRegistry));
+                            identity(defaultCollectorRegistry), druidFamiliesOrEmpty(defaultCollectorRegistry),
+                            meterRegistry instanceof CompositeMeterRegistry
+                                    ? "unsupported-composite-registry" : "not-a-prometheus-registry");
                     bindingLogged = true;
                 }
                 return;
@@ -116,8 +121,28 @@ final class DruidPrometheusCollectorCleanup {
             return true;
         }
         try {
-            // 直接 Registry 使用调用方持有的 Meter，避免 LRU 热路径在 remove() 后再 O(N) 扫描。
-            return removeFromRegistry(meterRegistry, meter, false);
+            if (directPrometheusCollectorRegistry(meterRegistry) == null) {
+                // REMARK：Composite 不做递归兼容；返回失败交由上层限频告警，防止静默残留。
+                return !(meterRegistry instanceof CompositeMeterRegistry);
+            }
+            String familyName = conventionName(meterRegistry, meter.getId());
+            Object collector = collectorFor(meterRegistry, familyName);
+            if (collector == null) {
+                return true;
+            }
+            boolean removed = removeChild(collector, meter);
+            if (!removed) {
+                // 空 collector 不会输出 metric family；重复清理时允许幂等成功。
+                if (childrenOf(collector).isEmpty()) {
+                    return true;
+                }
+                LOG.warn("druid prometheus collector child not found: family={} meter={} "
+                                + "micrometerVersionRisk=1.1.x-internal-layout",
+                        familyName, meter.getId());
+                return false;
+            }
+            // 空 collector collect() 返回空列表，保留它可供后续同名 Meter 重新注册。
+            return true;
         } catch (Exception error) {
             LOG.warn("druid prometheus collector cleanup failed: family={} meter={} "
                             + "micrometerVersionRisk=reflection-layout-changed error={}",
@@ -129,9 +154,26 @@ final class DruidPrometheusCollectorCleanup {
     /** 周期清理固定清空一期 7 个 Prometheus family 的全部 child。 */
     boolean clearAllDetailChildren() {
         try {
-            Set<Collection<?>> children = Collections.newSetFromMap(
-                    new IdentityHashMap<Collection<?>, Boolean>());
-            collectChildren(meterRegistry, DETAIL_METER_IDS, children);
+            if (directPrometheusCollectorRegistry(meterRegistry) == null) {
+                if (meterRegistry instanceof CompositeMeterRegistry) {
+                    // REMARK：Registry 结构变化必须先补充新方案及 endpoint E2E，不允许静默跳过。
+                    LOG.error("druid prometheus collector family cleanup aborted: "
+                                    + "unsupportedRegistryType={} expected=direct-PrometheusMeterRegistry",
+                            meterRegistry.getClass().getName());
+                    return false;
+                }
+                // Simple/JMX 等 Registry 没有 Prometheus 暴露层，只需清理 Micrometer Meter。
+                return true;
+            }
+
+            List<Collection<?>> children = new ArrayList<Collection<?>>(DETAIL_METER_IDS.size());
+            for (Meter.Id id : DETAIL_METER_IDS) {
+                String family = conventionName(meterRegistry, id);
+                Object collector = collectorFor(meterRegistry, family);
+                if (collector != null) {
+                    children.add(childrenOf(collector));
+                }
+            }
             // 先完成全部反射解析，再统一修改，避免解析中途失败造成部分 family 已清空。
             for (Collection<?> familyChildren : children) {
                 familyChildren.clear();
@@ -146,145 +188,15 @@ final class DruidPrometheusCollectorCleanup {
         }
     }
 
-    /**
-     * CompositeMeterRegistry.remove() 不保证注销所有子 Registry 的实际 Meter。
-     * family child 清空后通过 Micrometer 公开 API 扫描一次子 Registry 并同步注销，
-     * 避免后续注册复用一个已失去 Prometheus child 的旧 Meter。
-     */
-    boolean removeDetailMetersFromCompositeChildren() {
-        if (!(meterRegistry instanceof CompositeMeterRegistry)) {
-            return true;
-        }
-        try {
-            Set<MeterRegistry> visited = Collections.newSetFromMap(
-                    new IdentityHashMap<MeterRegistry, Boolean>());
-            for (MeterRegistry child : ((CompositeMeterRegistry) meterRegistry).getRegistries()) {
-                removeDetailMeters(child, visited);
-            }
-            return true;
-        } catch (RuntimeException error) {
-            LOG.error("druid micrometer composite child cleanup failed: meterRegistryType={} error={}",
-                    meterRegistry.getClass().getName(), error.toString());
-            return false;
-        }
-    }
-
+    /** 构造不带标签的固定明细 Meter ID，仅用于按 NamingConvention 定位 family。 */
     private static Meter.Id detailId(String name, Meter.Type type) {
         return new Meter.Id(name, Tags.empty(), null, null, type);
     }
 
-    private void collectChildren(MeterRegistry registry, List<Meter.Id> ids,
-                                 Set<Collection<?>> children) throws Exception {
-        if (directPrometheusCollectorRegistry(registry) != null) {
-            Set<String> families = new HashSet<String>();
-            for (Meter.Id id : ids) {
-                families.add(conventionName(registry, id));
-            }
-            for (String family : families) {
-                Object collector = collectorFor(registry, family);
-                if (collector != null) {
-                    children.add(childrenOf(collector));
-                }
-            }
-            return;
-        }
-
-        if (!(registry instanceof CompositeMeterRegistry)) {
-            return;
-        }
-        for (MeterRegistry child : ((CompositeMeterRegistry) registry).getRegistries()) {
-            collectChildren(child, ids, children);
-        }
-    }
-
-    private boolean removeFromRegistry(MeterRegistry registry, Meter target,
-                                       boolean locateChildMeter) throws Exception {
-        Object collectorRegistry = directPrometheusCollectorRegistry(registry);
-        if (collectorRegistry != null) {
-            Meter actual = target;
-            if (locateChildMeter) {
-                actual = findMeter(registry, target);
-                if (actual == null) {
-                    // 子 Registry 已经不再持有 Meter 时，暴露层 child 仍可能存在；用目标 ID 继续定位。
-                    actual = target;
-                }
-            }
-            // collectorMap 的 key 由 Registry 的 NamingConvention 生成，不能手写下划线规则。
-            String familyName = conventionName(registry, actual.getId());
-            Object collector = collectorFor(registry, familyName);
-            if (collector == null) {
-                return true;
-            }
-            // CompositeMeterRegistry 的 remove 不会移除子 Registry 中的实际 Meter，先通过公开 API 移除。
-            if (locateChildMeter && actual != target) {
-                registry.remove(actual);
-            }
-            boolean removed = removeChild(collector, actual);
-            if (!removed) {
-                // 空 collector 不会输出 metric family；重复清理时允许幂等成功。
-                if (childrenOf(collector).isEmpty()) {
-                    return true;
-                }
-                LOG.warn("druid prometheus collector child not found: family={} meter={} "
-                                + "micrometerVersionRisk=1.1.x-internal-layout",
-                        familyName, actual.getId());
-                return false;
-            }
-            // MicrometerCollector 没有 child 时 collect() 返回空列表，无需注销整个 family。
-            // 保留空 collector 还能让同名 Meter 后续直接复用，避免修改 collectorMap 私有状态。
-            return true;
-        }
-
-        if (!(registry instanceof CompositeMeterRegistry)) {
-            // 普通 Simple/JMX 等 Registry 没有 Prometheus 暴露层，不需要额外同步。
-            return true;
-        }
-        boolean found = false;
-        boolean success = true;
-        for (MeterRegistry child : ((CompositeMeterRegistry) registry).getRegistries()) {
-            if (directPrometheusCollectorRegistry(child) != null
-                    || child instanceof CompositeMeterRegistry) {
-                found = true;
-                success &= removeFromRegistry(child, target, true);
-            }
-        }
-        return !found || success;
-    }
-
-    private void removeDetailMeters(MeterRegistry registry, Set<MeterRegistry> visited) {
-        if (!visited.add(registry)) {
-            return;
-        }
-        // getMeters() 只扫描一次并复制，避免边遍历边注销引发实现相关行为。
-        for (Meter meter : new ArrayList<Meter>(registry.getMeters())) {
-            if (isDetailMeter(meter.getId().getName())) {
-                registry.remove(meter);
-            }
-        }
-        if (registry instanceof CompositeMeterRegistry) {
-            for (MeterRegistry child : ((CompositeMeterRegistry) registry).getRegistries()) {
-                removeDetailMeters(child, visited);
-            }
-        }
-    }
-
-    private Object prometheusCollectorRegistry() throws Exception {
-        Object direct = directPrometheusCollectorRegistry(meterRegistry);
-        if (direct != null) {
-            return direct;
-        }
-        if (!(meterRegistry instanceof CompositeMeterRegistry)) {
-            return null;
-        }
-        for (MeterRegistry child : ((CompositeMeterRegistry) meterRegistry).getRegistries()) {
-            Object nested = new DruidPrometheusCollectorCleanup(child).prometheusCollectorRegistry();
-            if (nested != null) {
-                return nested;
-            }
-        }
-        return null;
-    }
-
+    /**
+     * 取得直接 PrometheusMeterRegistry 绑定的 CollectorRegistry。
+     * 返回 null 表示不是直接 Prometheus Registry；这里不会向 Composite 子 Registry 递归。
+     */
     private Object directPrometheusCollectorRegistry(MeterRegistry registry) throws Exception {
         Method method = findMethod(registry.getClass(), "getPrometheusRegistry");
         return method == null ? null : method.invoke(registry);
@@ -301,6 +213,7 @@ final class DruidPrometheusCollectorCleanup {
         }
     }
 
+    /** 诊断场景下安全读取 Druid family；依赖缺失或布局变化时返回空集合。 */
     private List<String> druidFamiliesOrEmpty(Object collectorRegistry) {
         if (collectorRegistry == null) {
             return Collections.emptyList();
@@ -312,19 +225,12 @@ final class DruidPrometheusCollectorCleanup {
         }
     }
 
+    /** 输出对象 identity，空对象使用可读占位符，便于对比两个 CollectorRegistry。 */
     private static Object identity(Object value) {
         return value == null ? "unavailable" : System.identityHashCode(value);
     }
 
-    private Meter findMeter(MeterRegistry registry, Meter target) {
-        for (Meter meter : registry.getMeters()) {
-            if (meter.getId().equals(target.getId())) {
-                return meter;
-            }
-        }
-        return null;
-    }
-
+    /** 按 Micrometer 计算出的 family 名从 1.1.x collectorMap 中取得 collector。 */
     private Object collectorFor(MeterRegistry registry, String familyName) throws Exception {
         Field field = findField(registry.getClass(), "collectorMap");
         if (field == null) {
@@ -338,6 +244,7 @@ final class DruidPrometheusCollectorCleanup {
         return ((Map<?, ?>) value).get(familyName);
     }
 
+    /** 从指定 family 精确删除引用目标 Meter 的一个 child，不影响同 family 的其他标签。 */
     private boolean removeChild(Object collector, Meter meter) throws Exception {
         Collection<?> children = childrenOf(collector);
         Iterator<?> iterator = children.iterator();
@@ -354,6 +261,7 @@ final class DruidPrometheusCollectorCleanup {
         return false;
     }
 
+    /** 读取 Micrometer 1.1.x MicrometerCollector.children 集合。 */
     private Collection<?> childrenOf(Object collector) throws Exception {
         Field field = findField(collector.getClass(), "children");
         if (field == null) {
@@ -367,6 +275,10 @@ final class DruidPrometheusCollectorCleanup {
         return (Collection<?>) value;
     }
 
+    /**
+     * 判断 collector child 是否捕获目标 Meter。
+     * 只检查 child 自身及其父类声明字段，不递归遍历任意对象图。
+     */
     private boolean referencesMeter(Object value, Meter meter) throws IllegalAccessException {
         if (value == meter) {
             return true;
@@ -392,6 +304,7 @@ final class DruidPrometheusCollectorCleanup {
         return false;
     }
 
+    /** 枚举 CollectorRegistry 当前实际输出的 Druid SQL/URI metric family。 */
     private List<String> druidFamilies(Object collectorRegistry) throws Exception {
         Method method = findMethod(collectorRegistry.getClass(), "metricFamilySamples");
         if (method == null) {
@@ -418,27 +331,22 @@ final class DruidPrometheusCollectorCleanup {
         return families;
     }
 
+    /** 判断 Micrometer 逻辑名称是否属于 Druid SQL/URI 指标命名空间。 */
     private static boolean isDruidMeter(String name) {
         return name != null && (name.startsWith("druid.sql.") || name.startsWith("druid.uri."));
     }
 
-    private static boolean isDetailMeter(String name) {
-        for (Meter.Id id : DETAIL_METER_IDS) {
-            if (id.getName().equals(name)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
+    /** 判断 Prometheus family 名称是否属于 Druid SQL/URI 指标命名空间。 */
     private static boolean isDruidFamily(String name) {
         return name != null && (name.startsWith(SQL_PREFIX) || name.startsWith(URI_PREFIX));
     }
 
+    /** 使用 Registry 当前 NamingConvention 将逻辑 Meter ID 转换为 collectorMap key。 */
     private static String conventionName(MeterRegistry registry, Meter.Id id) {
         return id.getConventionName(registry.config().namingConvention());
     }
 
+    /** 优先查找公开方法，旧版本无公开 API 时再沿类层级查找声明方法。 */
     private static Method findMethod(Class<?> type, String name, Class<?>... parameterTypes) {
         // 公开 API 优先，只有旧版本没有公开方法时才继续查找声明方法。
         try {
@@ -459,6 +367,7 @@ final class DruidPrometheusCollectorCleanup {
         return null;
     }
 
+    /** 优先查找公开字段，旧版本内部布局字段再沿类层级查找。 */
     private static Field findField(Class<?> type, String name) {
         // 诊断字段等公开 API 优先；collectorMap/children 才会进入私有字段反射。
         try {

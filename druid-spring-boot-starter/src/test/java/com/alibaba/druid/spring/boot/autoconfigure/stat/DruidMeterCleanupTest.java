@@ -96,6 +96,54 @@ public class DruidMeterCleanupTest {
         assertEquals(2, registry.find("druid.sql.execution.duration").meters().size());
     }
 
+    /** 验证手动清理复用正式链路，且不会吞掉已经到期的下一次自动清理。 */
+    @Test
+    public void cleanupNowRemovesMetersWithoutAdvancingAutomaticSchedule() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-08-07T10:00:00Z"), ZoneOffset.UTC);
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        DruidPrometheusMetricsListener listener = newListener(cleanupConfig(3), registry, clock);
+        listener.init();
+
+        listener.onSqlExecute("select 1", dataSource("primary"), 100L, null);
+        clock.setInstant(Instant.parse("2026-08-07T12:05:00Z"));
+        DruidPrometheusCleanupResult result = listener.cleanupNow();
+
+        assertTrue(result.isExecuted());
+        assertTrue(result.isFamilySuccess());
+        assertEquals("cleanup-completed", result.getDetail());
+        assertEquals(1, result.getSqlIdentityBefore());
+        assertEquals(3, result.getSqlMeterBefore());
+        assertEquals(3, result.getSqlMeterSuccess());
+        assertNull(registry.find("druid.sql.execution.duration")
+                .tags("sql", DruidPrometheusMetricsListener.calculateSqlMd5("select 1"),
+                        "datasource", "primary").timer());
+
+        // 手动清理后注册一个孤儿明细 Meter；下一条事件仍应补做 12:00 已到期的自动清理。
+        String orphanHash = DruidPrometheusMetricsListener.calculateSqlMd5("select orphan");
+        io.micrometer.core.instrument.Timer.builder("druid.sql.execution.duration")
+                .tags("sql", orphanHash, "datasource", "primary").register(registry);
+        listener.onSqlExecute("select 2", dataSource("primary"), 100L, null);
+
+        assertNull(registry.find("druid.sql.execution.duration")
+                .tags("sql", orphanHash, "datasource", "primary").timer());
+        assertNotNull(registry.find("druid.sql.execution.duration")
+                .tags("sql", DruidPrometheusMetricsListener.calculateSqlMd5("select 2"),
+                        "datasource", "primary").timer());
+    }
+
+    /** 验证 Listener 尚未绑定 Registry 时手动接口返回未执行，而不是伪报成功。 */
+    @Test
+    public void cleanupNowReportsUnavailableBeforeInitialization() {
+        DruidPrometheusMetricsListener listener = newListener(cleanupConfig(3),
+                new SimpleMeterRegistry(), Clock.systemUTC());
+
+        DruidPrometheusCleanupResult result = listener.cleanupNow();
+
+        assertFalse(result.isExecuted());
+        assertFalse(result.isFamilySuccess());
+        assertEquals("meter-registry-unavailable", result.getDetail());
+    }
+
     // ==================== 固定清理点触发 ====================
 
     @Test

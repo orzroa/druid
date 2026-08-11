@@ -24,7 +24,7 @@
 
 ## 触发模型
 
-本方案不创建定时任务、`TaskScheduler`、后台线程或轮询任务。清理由一期 listener 收到 SQL/URI 事件时顺带判断并触发。清理周期由配置项 `events.cleanup.interval-hours` 决定，记为整数 `n`：
+本方案不创建定时任务、`TaskScheduler`、后台线程或轮询任务。自动清理由一期 listener 收到 SQL/URI 事件时顺带判断并触发；人工验证也可显式调用后文的 `cleanupNow()`。自动清理周期由配置项 `events.cleanup.interval-hours` 决定，记为整数 `n`：
 
 1. 当 `n <= 0` 时，清理完全关闭，不执行任何清理判断或操作。
 2. 当 `n >= 24` 时，退化为每日清理一次：仅在跨入新自然日的首条事件触发清理，当日内不再清理。
@@ -44,6 +44,21 @@
 因此“每 `n` 小时清理一次”的准确含义是：清理点是按业务时区当日 `00:00` 起每 `n` 整点固定的（`00:00`、`n:00`、`2n:00`……），与上次清理在区间内的具体时刻无关；事件到达时若发现当前已到达缓存的下一个固定清理点，即触发一次清理。某区间内一直没有 SQL/URI 事件时不会执行无意义清理；下一次事件到来时按规则补做一次，但不会按错过的区间逐个补跑。
 
 清理基准和下一个清理点不持久化到磁盘或外部存储。应用重启后，旧 JVM 的 Meter 和引用已经随进程释放，新 JVM 的清理基准为未初始化，第一条事件按规则不立即清理，而是建立当前基准和下一个固定清理点；避免新进程刚启动就做无意义的空清理。每个应用实例独立维护该时间，不需要分布式锁。
+
+### 手动触发
+
+Starter 永久提供 `DruidPrometheusMetricsCleaner.cleanupNow()`，用于人工验证或运维工具立即清理
+当前实例的一期 SQL/URI 明细指标。该接口复用自动清理的同一把写锁、固定 7 个 family 清理、
+Micrometer Meter 注销和本地 identity/LRU 释放链路；不创建独立清理实现。
+
+手动清理不读取 `interval-hours` 开关，也不修改 `lastCleanupAtMillis`、当前调度快照或下一次自动
+清理边界。自动清理已经到期时，手动调用后的下一条 SQL/URI 事件仍会按原计划补做一次自动清理。
+返回值 `DruidPrometheusCleanupResult` 包含是否实际执行、family 是否成功、清理前 identity/Meter 数
+和 Meter 成功/失败数；Listener 尚未绑定 Registry 时返回 `executed=false`，不得伪报成功。
+
+Starter 不直接暴露 HTTP，也不决定鉴权策略。auth 为人工验证临时增加仅在 `tpdev` profile 创建的
+无鉴权 Controller：`POST /admin/druid/prometheus/cleanup`。该入口不得通过启用 `tpdev` profile 的方式
+带入其他环境；需要长期用于生产时，应由集成服务另行增加权限和审计控制。
 
 ## 时间语义
 
@@ -68,7 +83,7 @@ spring.datasource.druid.prometheus.events.cleanup.interval-hours=6
 1. 普通事件在查找、创建和更新一期明细 Meter 的整个临界段持有读锁。
 2. 事件初步发现当前时间已到缓存清理点时申请写锁；取得写锁后必须重新读取当前时间、当前周期和缓存清理点，防止动态刷新混用新旧配置或多个并发事件重复清理。
 3. 确认需要清理后，先固定解析一期 7 个 SQL/URI metric family 的 `children`；全部解析成功后按 family 执行 `clear()`。该步骤不依赖当前 `MeterRegistry` 快照，因此能清理已经从 Micrometer 删除、却仍被 Prometheus 暴露的孤儿 child。
-4. 扫描 `MeterRegistry` 并按 7 个精确逻辑名称注销 Micrometer Meter；若注入的是 `CompositeMeterRegistry`，再通过公开 API 单次扫描各子 Registry 并同步注销实际 Meter。随后清空 SQL/URI identity 表、近似 LRU 元数据和 PENDING 状态。
+4. 扫描直接注入的 `PrometheusMeterRegistry`，按 7 个精确逻辑名称注销 Micrometer Meter，随后清空 SQL/URI identity 表、近似 LRU 元数据和 PENDING 状态。当前固定部署不递归处理 `CompositeMeterRegistry`；若实际注入 Composite，则输出 `ERROR`、中止本周期并保持 Meter 与本地状态不变。
 5. 本地状态释放完成后，更新最近清理基准和下一个固定清理点，然后释放写锁。
 6. 触发清理的当前事件重新进入一期正常记录流程，按需注册新 Meter，并成为新区间的第一条观测。
 
@@ -78,13 +93,13 @@ spring.datasource.druid.prometheus.events.cleanup.interval-hours=6
 
 - 业务日期（`yyyy-MM-dd`，按系统默认时区）
 - 时区 ID
-- 触发原因：`cross-day`（跨自然日）/ `new-interval`（同日进入新区间）
-- 固定清理点（`floor(h / n) * n:00`，按系统默认时区）
-- 区间序号（当日第几个 `n` 小时段，0-based）
+- 触发原因：`cross-day`（跨自然日）/ `new-interval`（同日进入新区间）/ `manual`（手动调用）
+- 固定清理点（自动清理为 `floor(h / n) * n:00`，手动清理为 `manual`）
+- 区间序号（自动清理为当日第几个 `n` 小时段，0-based；手动清理为 `manual`）
 - `interval-hours` 当前值
 - 清理开始时间、完成时间（ISO 8601 含时区）
 - 耗时毫秒
-- Prometheus family 清理结果、Composite Registry 树清理结果
+- Prometheus family 清理结果
 - 清理前 SQL/URI identity 数与 SQL/URI Meter 数（单位分开）
 - SQL/URI 成功注销 Meter 数、失败注销 Meter 数
 - 触发事件类型（`sql`/`uri`）和触发事件的数据源名（SQL 事件时）或已解析的 URI 模板（URI 事件时）
@@ -106,14 +121,16 @@ TRACE 仅用于短时故障定位；它会为每次指标操作产生业务日�
 
 ### 实际绑定关系
 
-当前 Starter 不创建独立 Registry。`DruidPrometheusMetricsListener` 通过 `ObjectProvider<MeterRegistry>` 获取 Spring 容器中的应用级 Registry；它可能是 `PrometheusMeterRegistry`，也可能是包含 Prometheus 子 Registry 的 `CompositeMeterRegistry`。
+当前 Starter 不创建独立 Registry。`DruidPrometheusMetricsListener` 通过 `ObjectProvider<MeterRegistry>` 获取 Spring 容器中的应用级 Registry。当前 auth 固定装配为直接的 `PrometheusMeterRegistry`，并显式绑定 `CollectorRegistry.defaultRegistry`；因此 Listener 清理的暴露层与 `/admin/prometheus` 读取的是同一对象。
 
 Micrometer 1.1.0 和 `simpleclient_spring_boot` 0.5.0 的关系如下：
 
 1. `PrometheusMeterRegistry(PrometheusConfig)` 会创建一个新的 `CollectorRegistry`。
 2. `PrometheusMeterRegistry(PrometheusConfig, CollectorRegistry, Clock)` 使用调用方传入的 `CollectorRegistry`。
 3. `simpleclient_spring_boot` 0.5.0 创建的 `PrometheusEndpoint` 固定暴露 `CollectorRegistry.defaultRegistry`。
-4. 因此，只有 Micrometer 的 Prometheus Registry 显式绑定到 `CollectorRegistry.defaultRegistry` 时，Druid 写入的指标和 `/admin/prometheus` 才处于同一条暴露链；若应用注入的是 `CompositeMeterRegistry`，必须检查其中实际的 Prometheus 子 Registry。
+4. 因此，只有 Micrometer 的 Prometheus Registry 显式绑定到 `CollectorRegistry.defaultRegistry` 时，Druid 写入的指标和 `/admin/prometheus` 才处于同一条暴露链。
+
+当前适配器有意只支持直接注入的 `PrometheusMeterRegistry`，不再递归向下搜索 `CompositeMeterRegistry`。若未来 Spring/Micrometer 装配改为 Composite，运行时会输出 `ERROR` 并失败关闭，不会静默报告清理成功。此时必须重新确认 Registry 与 endpoint 的绑定关系、重新设计清理路径，并通过真实 endpoint E2E 后才能启用；不能把递归泛化兼容直接带回事件热路径。
 
 初始化和每次清理完成后，`druid.prometheus.detail=TRACE` 会输出诊断日志，包含：
 
@@ -139,16 +156,15 @@ Micrometer 1.1.0 的 `MeterRegistry.remove(meter)` 只从 Micrometer 的 `meterM
 
 ### 精确清理实现
 
-清理按以下顺序执行：
+LRU 单 identity 淘汰和注册失败回滚按以下顺序执行：
 
 1. 使用公开 API `MeterRegistry.remove(meter)` 删除 Micrometer 逻辑层 Meter。
-2. 若是 `CompositeMeterRegistry`，定位实际 Prometheus 子 Registry，并通过公开 API 删除子 Registry 中对应的实际 Meter。
-3. 使用 Registry 当前配置的公开 `NamingConvention` 计算 collectorMap key，不能手写点号转下划线或 Timer `_seconds` 规则。
-4. 由于 Micrometer 1.1.0 没有公开的 child 删除 API，版本适配器反射读取 `PrometheusMeterRegistry.collectorMap` 和 `MicrometerCollector.children`，按捕获的 Meter 实例或相同 `Meter.Id` 精确定位并删除一个 child。
-5. 不注销仍有其他 child 的 metric family，避免误删其他 SQL/URI 标签组合。最后一个 child 删除后保留固定数量的空 `MicrometerCollector`；1.1.0 的空 collector `collect()` 返回空列表，不会出现在 scrape 中，后续同名 Meter 还能安全复用它。该对象数量最多等于一期固定的 7 个 metric family，不随 SQL/URI identity 数增长。
-6. Prometheus child 精确清理失败会记录限频告警，但不保存失败句柄；下一次周期清理固定清空全部 7 个 family，可覆盖该孤儿 child。关闭周期清理时，告警是唯一自动诊断信号，需要人工处置。
+2. 使用直接 Registry 当前配置的公开 `NamingConvention` 计算 collectorMap key，不能手写点号转下划线或 Timer `_seconds` 规则。
+3. 由于 Micrometer 1.1.0 没有公开的 child 删除 API，版本适配器反射读取 `PrometheusMeterRegistry.collectorMap` 和 `MicrometerCollector.children`，按捕获的 Meter 实例或相同 `Meter.Id` 精确定位并删除一个 child。
+4. 不注销仍有其他 child 的 metric family，避免误删其他 SQL/URI 标签组合。最后一个 child 删除后保留固定数量的空 `MicrometerCollector`；1.1.0 的空 collector `collect()` 返回空列表，不会出现在 scrape 中，后续同名 Meter 还能安全复用它。该对象数量最多等于一期固定的 7 个 metric family，不随 SQL/URI identity 数增长。
+5. Prometheus child 精确清理失败会记录限频告警，但不保存失败句柄；下一次周期清理固定清空全部 7 个 family，可覆盖该孤儿 child。关闭周期清理时，告警是唯一自动诊断信号，需要人工处置。
 
-上述顺序仅适用于 LRU 单 identity 淘汰和注册失败回滚。定期清理已确定要删除全部一期明细 Meter，因此固定解析 7 个已知 family，一次性清空这些 collector 的
+定期清理已确定要删除全部一期明细 Meter，因此固定解析 7 个已知 family，一次性清空这些 collector 的
 `children`，再执行 `MeterRegistry.remove()`；这避免在 `CopyOnWriteArrayList` 上逐项删除
 产生 O(N²) 数组复制。批量清理会先解析全部目标 collector，全部成功后才统一 `clear()`；
 解析失败时输出 `ERROR` 并中止本周期，保持 Meter 和 identity 不变，禁止退化为逐项
@@ -197,7 +213,8 @@ collector 清理。批量清理只清空 child，不从 `CollectorRegistry` 注�
 10. 验证清理完成后输出一条组件业务日志，包含业务日期、时区、触发原因（`cross-day`/`new-interval`）、固定清理点、区间序号、`interval-hours`、开始/完成时间、耗时、清理前 SQL/URI identity 数、成功/失败注销数、触发事件类型，以及 SQL 事件的数据源名或 URI 事件的已解析 URI 模板；日志不得写入结构化事件 logger，也不得包含 SQL 或 SQL MD5。事后可通过该日志核对每次清理是否按时触发、清理了多少存量对象。
 11. 使用 Micrometer Prometheus 1.1.0 验证“创建 Druid Meter → scrape 可见 → 删除 Meter 和 collector child → scrape 不再可见”，并确认同一 Registry 中的非 Druid Collector 仍然存在。
 12. 使用 `simpleclient_spring_boot` 0.5.0 的实际 `PrometheusMvcEndpoint` 和 `CollectorRegistry.defaultRegistry` 验证 `/admin/prometheus` 暴露链，而不只验证 `PrometheusMeterRegistry.scrape()`。
-13. 验证 `CompositeMeterRegistry`、自定义 `NamingConvention`、同 family 多标签 LRU 淘汰及 family 清空后重新注册：只能删除被淘汰 label set，其他 SQL/URI 标签必须继续暴露。
+13. 验证自定义 `NamingConvention`、同 family 多标签 LRU 淘汰及 family 清空后重新注册：只能删除被 LRU 淘汰的 label set，其他 SQL/URI 标签必须继续暴露；注入 `CompositeMeterRegistry` 时必须失败关闭并保留现有暴露数据，不能静默报告成功。
+14. 验证 `cleanupNow()` 复用 family/Meter/LRU 正式清理链路，未初始化时不伪报成功，且不会推进自动调度；集成服务通过真实 HTTP 调用后，旧 series 必须从实际 Prometheus endpoint 消失，新指标仍可重新注册。
 
 ## 已接受的影响
 
@@ -377,10 +394,39 @@ Micrometer Registry 的孤儿 child，也不注销 collector、不影响其他�
    本周期，下一周期仍固定通杀，不进入 O(N²) 的逐 child fallback；
 3. LRU 和注册失败回滚仍精确删除单个 child，避免误删同 family 的其他有效标签；直接
    Prometheus Registry 不再在每次 LRU 删除后额外 O(N) 扫描 Meter；
-4. `CompositeMeterRegistry` 的周期路径在 family 清空后使用 Micrometer 公开 API 单次扫描子
-   Registry 并注销实际 Meter，避免新注册复用一个已清空 child 的旧 Meter；
-5. 清理日志拆分 identity 数和 Meter 数，并增加 `familySuccess`、`registryTreeSuccess`，避免
-   把不同单位混在同一组 success/before 字段中。
+4. 清理日志拆分 identity 数和 Meter 数，并增加 `familySuccess`，避免把不同单位混在同一组
+   success/before 字段中。
 
-验证结果：Starter 全量 `70/70`、清理定向 `26/26`、7 个实际 family 批量清理 `11/11`；
+验证结果：当时 Starter 全量 `70/70`、清理定向 `26/26`、7 个实际 family 批量清理 `11/11`；
 auth `tpdev` 长链路 `2/2`，真实 `/admin/prometheus` 中旧 SQL series 消失且新周期 series 存在。
+
+### 实验 13：固定依赖与实际装配下移除 Composite 泛化兼容
+
+复审确认 auth 当前直接注入绑定 `CollectorRegistry.defaultRegistry` 的
+`PrometheusMeterRegistry`，实际清理链路不存在 Composite 层级。为减少无效分支、Registry
+递归扫描和后续误判，删除 Composite 子 Registry 递归定位、递归注销及相关结果字段。
+
+生产适配器保留明确的 `REMARK` 和运行时失败关闭：若未来 Registry 结构变为
+`CompositeMeterRegistry`，family 清理输出 `ERROR` 并中止，单 Meter 精确清理返回失败并触发
+限频告警；开发者必须重新设计并通过真实 `/admin/prometheus` E2E，不能依赖未经验证的泛化回退。
+
+2026-08-11 验证结果：Starter 全量 `69/69`、清理定向 `25/25`、Collector/family 清理
+`10/10`；本地 `install` 成功；auth `tpdev` 长链路 `2/2`，真实
+`/admin/prometheus` 中旧 SQL series 消失且新周期 series 存在。测试总数减少 1 是因为删除了
+一个“Composite 可成功清理”的泛化兼容用例，并新增/保留“Composite 必须失败关闭”的约束用例，
+不是覆盖范围缺失。
+
+### 实验 14：cleanupNow 与 auth tpdev 人工入口
+
+Starter 增加永久接口 `DruidPrometheusMetricsCleaner.cleanupNow()` 及结构化返回值
+`DruidPrometheusCleanupResult`。实现复用自动清理写锁和 `cleanupDetailMeters()`，执行期间不修改
+自动清理时间基准或调度快照；完成日志使用 `reason=manual`、`boundary=manual`、`slot=manual`。
+
+auth 增加仅在 `tpdev` profile 创建的临时 Controller：
+`POST /admin/druid/prometheus/cleanup`。登录 Token 拦截器和 API 权限拦截器只排除这个精确路径；
+非 tpdev 环境没有对应 Controller。首次 E2E 发现只省略 Controller 鉴权注解仍会被全局拦截器返回
+`tokenexpier`，因此补齐了两层精确排除，并通过真实请求验证。
+
+2026-08-11 验证结果：Starter 全量 `72/72`，本地 `install` 成功；auth `tpdev` 长链路
+`3/3`。人工入口返回 `executed=true`、`familySuccess=true`，随后真实 `/admin/prometheus`
+不再输出清理前 SQL series，并能正常输出手动清理后新建的 SQL series。

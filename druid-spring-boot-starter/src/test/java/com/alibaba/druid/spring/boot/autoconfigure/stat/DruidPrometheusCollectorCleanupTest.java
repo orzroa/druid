@@ -36,6 +36,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.Collections;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
@@ -220,7 +221,7 @@ public class DruidPrometheusCollectorCleanupTest {
     }
 
     @Test
-    public void removeDruidTimerFromCompositeRemovesPrometheusChild() {
+    public void compositeRegistryFailsClosedUntilDedicatedCleanupIsDesigned() {
         CollectorRegistry collectorRegistry = new CollectorRegistry();
         PrometheusMeterRegistry prometheus = new PrometheusMeterRegistry(
                 PrometheusConfig.DEFAULT, collectorRegistry, Clock.SYSTEM);
@@ -232,34 +233,13 @@ public class DruidPrometheusCollectorCleanupTest {
                 .register(composite);
         assertTrue(prometheus.scrape().contains("druid_sql_execution_duration"));
 
-        assertNotNull(composite.remove(timer));
-        assertTrue(new DruidPrometheusCollectorCleanup(composite).remove(timer));
-
-        assertFalse(prometheus.scrape().contains("druid_sql_execution_duration"));
-    }
-
-    @Test
-    public void periodicCleanupRemovesCompositeChildMeterAndAllowsRecreation() {
-        CollectorRegistry collectorRegistry = new CollectorRegistry();
-        PrometheusMeterRegistry prometheus = new PrometheusMeterRegistry(
-                PrometheusConfig.DEFAULT, collectorRegistry, Clock.SYSTEM);
-        CompositeMeterRegistry composite = new CompositeMeterRegistry();
-        composite.add(prometheus);
-        Timer timer = Timer.builder("druid.uri.request.duration")
-                .tag("uri", "/composite/periodic").register(composite);
-        timer.record(1, java.util.concurrent.TimeUnit.MILLISECONDS);
         DruidPrometheusCollectorCleanup cleanup = new DruidPrometheusCollectorCleanup(composite);
-
-        assertTrue(cleanup.clearAllDetailChildren());
-        assertNotNull(composite.remove(timer));
-        assertTrue(cleanup.removeDetailMetersFromCompositeChildren());
-        assertNull(prometheus.find("druid.uri.request.duration")
-                .tag("uri", "/composite/periodic").timer());
-
-        Timer recreated = Timer.builder("druid.uri.request.duration")
-                .tag("uri", "/composite/periodic").register(composite);
-        recreated.record(1, java.util.concurrent.TimeUnit.MILLISECONDS);
-        assertTrue(prometheus.scrape().contains("/composite/periodic"));
+        assertFalse("Composite 未经独立设计和 E2E 前不能报告 family 清理成功",
+                cleanup.clearAllDetailChildren());
+        assertFalse("Composite 未经独立设计和 E2E 前不能报告单 Meter 清理成功",
+                cleanup.remove(timer));
+        assertTrue("失败关闭不能误删或伪装清理成功",
+                prometheus.scrape().contains("druid_sql_execution_duration"));
     }
 
     @Test
@@ -278,6 +258,36 @@ public class DruidPrometheusCollectorCleanupTest {
 
         assertFalse("/admin/prometheus 仍暴露已删除的 Druid Meter",
                 prometheusEndpointScrape().contains("druid_sql_endpoint_cleanup_duration"));
+    }
+
+    /** 验证公开 cleanupNow 接口能从实际 Prometheus 暴露层移除一期 SQL family。 */
+    @Test
+    public void cleanupNowNoLongerExposesDruidSqlFamily() {
+        CollectorRegistry collectorRegistry = new CollectorRegistry();
+        PrometheusMeterRegistry meterRegistry = new PrometheusMeterRegistry(
+                PrometheusConfig.DEFAULT, collectorRegistry, Clock.SYSTEM);
+        DruidStatProperties.Prometheus config = new DruidStatProperties.Prometheus();
+        config.getSqlMapping().setEnabled(false);
+        config.getEvents().getCleanup().setIntervalHours(1);
+        DruidPrometheusMetricsListener listener = new DruidPrometheusMetricsListener(
+                config, provider(meterRegistry), provider((DruidUriTemplateResolver) null));
+        listener.init();
+        try {
+            DataSourceProxy dataSource = mock(DataSourceProxy.class);
+            when(dataSource.getName()).thenReturn("primary");
+            String sqlHash = DruidPrometheusMetricsListener.calculateSqlMd5("select manual cleanup");
+            listener.onSqlExecute("select manual cleanup", dataSource, 1L, null);
+            assertTrue(meterRegistry.scrape().contains(sqlHash));
+
+            DruidPrometheusCleanupResult result = listener.cleanupNow();
+
+            assertTrue(result.isExecuted());
+            assertTrue(result.isFamilySuccess());
+            assertEquals(3, result.getSqlMeterSuccess());
+            assertFalse(meterRegistry.scrape().contains(sqlHash));
+        } finally {
+            listener.destroy();
+        }
     }
 
     @Test

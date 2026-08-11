@@ -53,15 +53,18 @@ final class DruidPrometheusMeterCleanup {
     private volatile long lastCleanupAtMillis = BASELINE_UNINITIALIZED;
     private volatile Schedule schedule = new Schedule(0, BASELINE_UNINITIALIZED);
 
+    /** 创建使用指定时钟和实际清理回调的事件驱动调度器。 */
     DruidPrometheusMeterCleanup(Clock clock, Handler handler) {
         this.clock = clock;
         this.handler = handler;
     }
 
+    /** 返回事件记录路径使用的读锁，防止记录过程与批量清理并发。 */
     ReentrantReadWriteLock.ReadLock readLock() {
         return lock.readLock();
     }
 
+    /** 返回配置刷新和批量清理使用的写锁。 */
     ReentrantReadWriteLock.WriteLock writeLock() {
         return lock.writeLock();
     }
@@ -104,14 +107,20 @@ final class DruidPrometheusMeterCleanup {
         }
     }
 
+    /** 在 SQL 事件进入记录路径前检查并按需触发清理。 */
     void maybeCleanupSql(DataSourceProxy dataSource) {
         maybeCleanup("sql", dataSource);
     }
 
+    /** 在 URI 事件进入记录路径前检查并按需触发清理。 */
     void maybeCleanupUri(String uriTemplate) {
         maybeCleanup("uri", uriTemplate);
     }
 
+    /**
+     * 使用无锁快照完成快速判定，到期后在写锁内二次确认并执行一次批量清理。
+     * 首次事件只建立时间基线，实际清理由后续跨边界事件触发。
+     */
     private void maybeCleanup(String triggerType, Object triggerSource) {
         Schedule current = schedule;
         int intervalHours = current.intervalHours;
@@ -192,6 +201,33 @@ final class DruidPrometheusMeterCleanup {
         }
     }
 
+    /**
+     * 在写锁内立即执行一次实际清理并输出 manual 日志。
+     * 本方法有意不读写 lastCleanupAtMillis 和 schedule，保证人工操作不改变自动调度。
+     */
+    CleanupCounts cleanupNow() {
+        CleanupResult result;
+        lock.writeLock().lock();
+        try {
+            long startedMillis = clock.millis();
+            long startNs = System.nanoTime();
+            CleanupCounts counts = handler.cleanup();
+            long finishedMillis = clock.millis();
+            long elapsedMs = (System.nanoTime() - startNs) / 1_000_000L;
+            result = new CleanupResult(startedMillis, finishedMillis, elapsedMs, "manual",
+                    schedule.intervalHours, -1, -1, counts);
+        } finally {
+            lock.writeLock().unlock();
+        }
+        try {
+            logCleanup(result, "manual", "cleanupNow");
+        } catch (RuntimeException ignored) {
+            // 手动清理已经完成，日志及自定义日志 Handler 的异常不能改变返回结果。
+        }
+        return result.counts;
+    }
+
+    /** 对 LRU 单 Meter 清理失败进行一秒限频告警，不保留逐项重试状态。 */
     void warnRemovalFailure(Meter.Id id, RuntimeException error) {
         long now = System.currentTimeMillis();
         long last = lastRemovalWarnMs.get();
@@ -202,6 +238,7 @@ final class DruidPrometheusMeterCleanup {
         }
     }
 
+    /** 根据应用时区计算引用时间之后的下一个整点清理边界。 */
     private long nextCleanupBoundaryMillis(long referenceMillis, int intervalHours) {
         ZoneId zone = clock.getZone();
         ZonedDateTime reference = Instant.ofEpochMilli(referenceMillis).atZone(zone);
@@ -216,6 +253,7 @@ final class DruidPrometheusMeterCleanup {
         return date.atTime(nextHour, 0).atZone(zone).toInstant().toEpochMilli();
     }
 
+    /** 判断本次清理是同日新区间还是跨日触发。 */
     private String cleanupReason(long lastMillis, long nowMillis) {
         ZoneId zone = clock.getZone();
         LocalDate lastDate = Instant.ofEpochMilli(lastMillis).atZone(zone).toLocalDate();
@@ -223,6 +261,7 @@ final class DruidPrometheusMeterCleanup {
         return lastDate.equals(nowDate) ? "new-interval" : "cross-day";
     }
 
+    /** 汇总清理时间、区间槽位及删除计数，供锁外日志输出。 */
     private CleanupResult cleanupResult(long startedMillis, long finishedMillis, long elapsedMs,
                                         String reason, int intervalHours, CleanupCounts counts) {
         ZonedDateTime started = Instant.ofEpochMilli(startedMillis).atZone(clock.getZone());
@@ -231,12 +270,15 @@ final class DruidPrometheusMeterCleanup {
                 slot, slot * intervalHours, counts);
     }
 
+    /** 输出一次批量清理的完整结果；触发来源解析失败不会改变清理结果。 */
     private void logCleanup(CleanupResult result, String triggerType, Object rawTriggerSource) {
         String triggerSource = "unknown";
         try {
             if ("sql".equals(triggerType) && rawTriggerSource instanceof DataSourceProxy) {
                 triggerSource = handler.dataSourceName((DataSourceProxy) rawTriggerSource);
             } else if ("uri".equals(triggerType) && rawTriggerSource instanceof String) {
+                triggerSource = (String) rawTriggerSource;
+            } else if ("manual".equals(triggerType) && rawTriggerSource instanceof String) {
                 triggerSource = (String) rawTriggerSource;
             }
         } catch (RuntimeException e) {
@@ -250,14 +292,14 @@ final class DruidPrometheusMeterCleanup {
         LOG.info("druid detail meter cleanup: date=" + started.toLocalDate()
                 + " zone=" + zone.getId()
                 + " reason=" + result.reason
-                + " boundary=" + String.format("%02d:00", result.boundaryHour)
-                + " slot=" + result.slot
+                + " boundary=" + (result.boundaryHour < 0
+                        ? "manual" : String.format("%02d:00", result.boundaryHour))
+                + " slot=" + (result.slot < 0 ? "manual" : result.slot)
                 + " interval-hours=" + result.intervalHours
                 + " started=" + started.format(TIME_FORMATTER)
                 + " finished=" + finished.format(TIME_FORMATTER)
                 + " elapsedMs=" + result.elapsedMs
                 + " familySuccess=" + counts.familySuccess
-                + " registryTreeSuccess=" + counts.registryTreeSuccess
                 + " sqlIdentityBefore=" + counts.sqlIdentityBefore
                 + " uriIdentityBefore=" + counts.uriIdentityBefore
                 + " sqlMeterBefore=" + counts.sqlMeterBefore
@@ -271,14 +313,15 @@ final class DruidPrometheusMeterCleanup {
     }
 
     interface Handler {
+        /** 在调度器写锁内执行实际的 family、Meter 和本地状态清理。 */
         CleanupCounts cleanup();
 
+        /** 将 SQL 触发源转换为便于排障的数据源名称。 */
         String dataSourceName(DataSourceProxy dataSource);
     }
 
     static final class CleanupCounts {
         final boolean familySuccess;
-        final boolean registryTreeSuccess;
         final int sqlIdentityBefore;
         final int uriIdentityBefore;
         final int sqlMeterBefore;
@@ -288,12 +331,11 @@ final class DruidPrometheusMeterCleanup {
         final int uriMeterSuccess;
         final int uriMeterFailed;
 
-        CleanupCounts(boolean familySuccess, boolean registryTreeSuccess,
-                      int sqlIdentityBefore, int uriIdentityBefore,
+        /** 保存一次清理前的规模及执行结果，避免日志阶段重新扫描 Registry。 */
+        CleanupCounts(boolean familySuccess, int sqlIdentityBefore, int uriIdentityBefore,
                       int sqlMeterBefore, int uriMeterBefore, int sqlMeterSuccess,
                       int sqlMeterFailed, int uriMeterSuccess, int uriMeterFailed) {
             this.familySuccess = familySuccess;
-            this.registryTreeSuccess = registryTreeSuccess;
             this.sqlIdentityBefore = sqlIdentityBefore;
             this.uriIdentityBefore = uriIdentityBefore;
             this.sqlMeterBefore = sqlMeterBefore;
@@ -309,6 +351,7 @@ final class DruidPrometheusMeterCleanup {
         private final int intervalHours;
         private final long nextCleanupAtMillis;
 
+        /** 创建不可变调度快照，供事件热路径无锁读取。 */
         private Schedule(int intervalHours, long nextCleanupAtMillis) {
             this.intervalHours = intervalHours;
             this.nextCleanupAtMillis = nextCleanupAtMillis;
@@ -325,6 +368,7 @@ final class DruidPrometheusMeterCleanup {
         private final int boundaryHour;
         private final CleanupCounts counts;
 
+        /** 创建一次已完成清理的不可变结果快照。 */
         private CleanupResult(long startedMillis, long finishedMillis, long elapsedMs, String reason,
                               int intervalHours, int slot, int boundaryHour, CleanupCounts counts) {
             this.startedMillis = startedMillis;

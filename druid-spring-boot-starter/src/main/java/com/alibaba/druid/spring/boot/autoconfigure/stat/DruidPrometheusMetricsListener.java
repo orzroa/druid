@@ -80,7 +80,7 @@ import java.util.concurrent.locks.Lock;
  * </ul>
  */
 public final class DruidPrometheusMetricsListener implements StatFilterEventListener, WebStatEventListener,
-        DruidPrometheusMetricsRefresher, BeanFactoryAware {
+        DruidPrometheusMetricsRefresher, DruidPrometheusMetricsCleaner, BeanFactoryAware {
     /** 明细指标排障日志；仅在 TRACE 级别下输出身份、Meter 和清理细节。 */
     private static final Logger DETAIL_LOG = LoggerFactory.getLogger("druid.prometheus.detail");
     /** Spring MVC 在请求属性中存放“最佳匹配路径模板”的 key，例如 {@code /users/{id}}。 */
@@ -156,11 +156,13 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         this.meterRegistryProvider = meterRegistryProvider;
         this.uriTemplateResolverProvider = uriTemplateResolverProvider;
         this.meterCleanup = new DruidPrometheusMeterCleanup(clock, new DruidPrometheusMeterCleanup.Handler() {
+            /** 在调度器写锁内执行 Listener 持有的一期明细指标清理。 */
             @Override
             public DruidPrometheusMeterCleanup.CleanupCounts cleanup() {
                 return cleanupDetailMeters();
             }
 
+            /** 将 SQL 清理触发源解析为数据源名称，仅供完成日志使用。 */
             @Override
             public String dataSourceName(DataSourceProxy dataSource) {
                 return DruidPrometheusMetricsListener.this.dataSourceName(dataSource);
@@ -224,6 +226,25 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
                 writeLock.unlock();
             }
         }
+    }
+
+    /**
+     * 立即执行一期 SQL/URI 明细指标清理。
+     * 手动清理与事件记录、自动清理共用写锁，但不会推进自动清理的时间基准或调度边界。
+     */
+    @Override
+    public DruidPrometheusCleanupResult cleanupNow() {
+        if (meterRegistry == null || collectorCleanup == null) {
+            return new DruidPrometheusCleanupResult(false, false, "meter-registry-unavailable",
+                    0, 0, 0, 0, 0, 0, 0, 0);
+        }
+        DruidPrometheusMeterCleanup.CleanupCounts counts = meterCleanup.cleanupNow();
+        return new DruidPrometheusCleanupResult(true, counts.familySuccess,
+                counts.familySuccess ? "cleanup-completed" : "family-cleanup-failed",
+                counts.sqlIdentityBefore, counts.uriIdentityBefore,
+                counts.sqlMeterBefore, counts.uriMeterBefore,
+                counts.sqlMeterSuccess, counts.sqlMeterFailed,
+                counts.uriMeterSuccess, counts.uriMeterFailed);
     }
 
     /**
@@ -385,7 +406,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         if (cleanup != null && !cleanup.clearAllDetailChildren()) {
             // family 解析失败时保持 Meter 和 identity 不变；禁止退化为 O(N²) 逐项清理。
             DruidPrometheusMeterCleanup.CleanupCounts failed = new DruidPrometheusMeterCleanup.CleanupCounts(
-                    false, false, sqlBefore, uriBefore, sqlMeters.size(), uriDetailMeters.size(),
+                    false, sqlBefore, uriBefore, sqlMeters.size(), uriDetailMeters.size(),
                     0, 0, 0, 0);
             cleanup.logBinding("cleanup-family-failed");
             return failed;
@@ -403,22 +424,20 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         for (Meter meter : uriDetailMeters.values()) {
             if (removeMeterFromRegistry(meter, "periodic-cleanup")) uriSuccess++; else uriFailed++;
         }
-        // Composite 的顶层 remove 不保证同步注销子 Registry；统一单次扫描子 Registry 补齐公开 API 删除。
-        boolean registryTreeSuccess = cleanup == null || cleanup.removeDetailMetersFromCompositeChildren();
         uriMeters.clear();
 
         DruidPrometheusMeterCleanup.CleanupCounts counts = new DruidPrometheusMeterCleanup.CleanupCounts(
-                true, registryTreeSuccess, sqlBefore, uriBefore, sqlMeters.size(), uriDetailMeters.size(),
+                true, sqlBefore, uriBefore, sqlMeters.size(), uriDetailMeters.size(),
                 sqlSuccess, sqlFailed, uriSuccess, uriFailed);
         if (cleanup != null) {
             cleanup.logBinding("cleanup");
         }
         // 汇总本周期 SQL、URI 的删除结果。
         if (DETAIL_LOG.isTraceEnabled()) {
-            DETAIL_LOG.trace("druid detail meter cleanup: action=finish familySuccess=true registryTreeSuccess={} "
+            DETAIL_LOG.trace("druid detail meter cleanup: action=finish familySuccess=true "
                             + "sqlIdentityBefore={} uriIdentityBefore={} sqlMeterBefore={} uriMeterBefore={} "
                             + "sqlMeterSuccess={} sqlMeterFailed={} uriMeterSuccess={} uriMeterFailed={} registryMeters={}",
-                    registryTreeSuccess, sqlBefore, uriBefore, sqlMeters.size(), uriDetailMeters.size(),
+                    sqlBefore, uriBefore, sqlMeters.size(), uriDetailMeters.size(),
                     sqlSuccess, sqlFailed, uriSuccess, uriFailed, meterRegistry.getMeters().size());
         }
         return counts;
@@ -444,12 +463,14 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         }
     }
 
+    /** 判断逻辑名称是否属于一期需要清理的 3 个 SQL 明细 Meter。 */
     private static boolean isSqlDetailMeter(String name) {
         return SQL_EXECUTION_DURATION.equals(name)
                 || SQL_AFFECTED_ROWS.equals(name)
                 || SQL_FETCHED_ROWS.equals(name);
     }
 
+    /** 判断逻辑名称是否属于一期需要清理的 4 个 URI 明细 Meter。 */
     private static boolean isUriDetailMeter(String name) {
         return URI_REQUEST_DURATION.equals(name)
                 || URI_JDBC_EXECUTIONS.equals(name)
@@ -457,10 +478,12 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
                 || URI_JDBC_FETCHED_ROWS.equals(name);
     }
 
+    /** 判断逻辑名称是否属于一期需要清理的任一 SQL/URI 明细 Meter。 */
     private static boolean isDetailMeter(String name) {
         return isSqlDetailMeter(name) || isUriDetailMeter(name);
     }
 
+    /** 根据 Registry 快照中的 sql、datasource 标签统计待清理 SQL identity 数。 */
     private static int countSqlIdentities(Map<Meter.Id, Meter> meters) {
         Map<String, Boolean> identities = new LinkedHashMap<String, Boolean>();
         for (Meter.Id id : meters.keySet()) {
@@ -469,6 +492,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         return identities.size();
     }
 
+    /** 根据 Registry 快照中的 uri 标签统计待清理 URI identity 数。 */
     private static int countUriIdentities(Map<Meter.Id, Meter> meters) {
         Map<String, Boolean> identities = new LinkedHashMap<String, Boolean>();
         for (Meter.Id id : meters.keySet()) {
@@ -997,6 +1021,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         }
     }
 
+    /** 扫描当前 SQL 近似 LRU，返回最久未访问的待淘汰状态。 */
     private Map.Entry<String, SqlState> oldestSqlState() {
         Map.Entry<String, SqlState> oldest = null;
         for (Map.Entry<String, SqlState> entry : sqlStates.entrySet()) {
@@ -1007,6 +1032,7 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         return oldest;
     }
 
+    /** 扫描当前 URI 近似 LRU，返回最久未访问的待淘汰状态。 */
     private Map.Entry<String, UriMeters> oldestUriMeters() {
         Map.Entry<String, UriMeters> oldest = null;
         for (Map.Entry<String, UriMeters> entry : uriMeters.entrySet()) {
@@ -1045,12 +1071,14 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
         return meter;
     }
 
+    /** 精确注销一个被 LRU 淘汰的 SQL identity 对应的 3 个 Meter 及其 child。 */
     private void removeSqlMeters(SqlMeters meters) {
         removeMeterPrecisely(meters.timer, "sql-lru");
         removeMeterPrecisely(meters.affectedRows, "sql-lru");
         removeMeterPrecisely(meters.fetchedRows, "sql-lru");
     }
 
+    /** 精确注销一个被 LRU 淘汰的 URI identity 对应的 4 个 Meter 及其 child。 */
     private void removeUriMeters(UriMeters meters) {
         removeMeterPrecisely(meters.timer, "uri-lru");
         removeMeterPrecisely(meters.jdbcExecutions, "uri-lru");
