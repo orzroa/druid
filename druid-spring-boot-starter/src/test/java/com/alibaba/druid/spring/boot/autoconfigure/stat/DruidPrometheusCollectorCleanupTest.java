@@ -17,6 +17,7 @@ package com.alibaba.druid.spring.boot.autoconfigure.stat;
 
 import com.alibaba.druid.proxy.jdbc.DataSourceProxy;
 import com.alibaba.druid.spring.boot.autoconfigure.properties.DruidStatProperties;
+import io.micrometer.core.instrument.AbstractTimer;
 import io.micrometer.core.instrument.Clock;
 import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.Meter;
@@ -33,6 +34,7 @@ import org.springframework.http.ResponseEntity;
 
 import javax.servlet.http.HttpServletRequest;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Collections;
 
@@ -40,12 +42,83 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertNotSame;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /** 验证 Micrometer 1.1.0 Prometheus 暴露层同步清理，不调用全局 CollectorRegistry.clear()。 */
 public class DruidPrometheusCollectorCleanupTest {
+    @Test
+    public void detailTimersDoNotRetainPauseResourcesAcrossEvictionAndRecreation() throws Exception {
+        PrometheusMeterRegistry registry = new PrometheusMeterRegistry(
+                PrometheusConfig.DEFAULT, new CollectorRegistry(), Clock.SYSTEM);
+        Object registryPauseDetector = registry.config().pauseDetector();
+        Timer application = Timer.builder("application.request.duration").register(registry);
+        assertNotNull(timerResource(application, "intervalEstimator"));
+
+        DruidStatProperties.Prometheus config = new DruidStatProperties.Prometheus();
+        config.getSqlMapping().setEnabled(false);
+        config.getEvents().setMaxSqlIdentities(1);
+        config.getEvents().setMaxUriIdentities(1);
+        config.getEvents().getCleanup().setIntervalHours(0);
+        DruidPrometheusMetricsListener listener = new DruidPrometheusMetricsListener(
+                config, provider(registry), provider((DruidUriTemplateResolver) null));
+        listener.init();
+        try {
+            DataSourceProxy dataSource = mock(DataSourceProxy.class);
+            when(dataSource.getName()).thenReturn("primary");
+            Timer previousSql = null;
+            Timer previousUri = null;
+            for (int cycle = 0; cycle < 20; cycle++) {
+                listener.onSqlExecute("select 1", dataSource, 1000000L, null);
+                listener.onWebRequest(request("/first/{id}"), "/first/1", 1000000L, 0, 0, 0, null);
+                Timer sql = registry.find("druid.sql.execution.duration").timer();
+                Timer uri = registry.find("druid.uri.request.duration").timer();
+                for (Timer timer : new Timer[]{sql, uri}) {
+                    assertNotNull(timer);
+                    assertNull("明细 Timer 不应创建 LatencyUtils Estimator", timerResource(timer, "intervalEstimator"));
+                    assertNull("明细 Timer 不应绑定共享暂停检测器", timerResource(timer, "pauseDetector"));
+                    assertEquals(1L, timer.count());
+                    assertEquals(1.0, timer.totalTime(java.util.concurrent.TimeUnit.MILLISECONDS), 0.0);
+                }
+                assertNotSame(previousSql, sql);
+                assertNotSame(previousUri, uri);
+
+                listener.onSqlExecute("select 2", dataSource, 1000000L, null);
+                listener.onWebRequest(request("/second/{id}"), "/second/2", 1000000L, 0, 0, 0, null);
+                assertNull(registry.find("druid.sql.execution.duration")
+                        .tag("sql", DruidPrometheusMetricsListener.calculateSqlMd5("select 1")).timer());
+                assertNull(registry.find("druid.uri.request.duration").tag("uri", "/first/{id}").timer());
+                assertNull(timerResource(registry.find("druid.sql.execution.duration").timer(), "intervalEstimator"));
+                assertNull(timerResource(registry.find("druid.uri.request.duration").timer(), "intervalEstimator"));
+
+                assertTrue(listener.cleanupNow().isFamilySuccess());
+                assertNull(registry.find("druid.sql.execution.duration").timer());
+                assertNull(registry.find("druid.uri.request.duration").timer());
+                String scrape = registry.scrape();
+                assertFalse(scrape.contains("druid_sql_execution_duration"));
+                assertFalse(scrape.contains("druid_uri_request_duration"));
+                assertTrue(scrape.contains("application_request_duration"));
+                assertSame(registryPauseDetector, registry.config().pauseDetector());
+                assertSame(application, registry.find("application.request.duration").timer());
+                previousSql = sql;
+                previousUri = uri;
+            }
+        } finally {
+            listener.destroy();
+            registry.close();
+        }
+    }
+
+    /** 锁定实际 Micrometer 1.1.0 的资源字段，避免只验证 Registry/collector 数量。 */
+    private static Object timerResource(Timer timer, String name) throws Exception {
+        Field field = AbstractTimer.class.getDeclaredField(name);
+        field.setAccessible(true);
+        return field.get(timer);
+    }
+
     @Test
     public void bulkClearRemovesOnlyRequestedDruidFamiliesAndAllowsRecreation() {
         CollectorRegistry collectorRegistry = new CollectorRegistry();

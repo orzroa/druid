@@ -26,6 +26,7 @@ import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.distribution.pause.NoPauseDetector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.BeansException;
@@ -1048,7 +1049,8 @@ public final class DruidPrometheusMetricsListener implements StatFilterEventList
             throw new IllegalArgumentException("not a Druid detail meter: " + name);
         }
         boolean existedBefore = meterRegistry.find(name).tags(tags).meter() != null;
-        Timer meter = builder.register(meterRegistry);
+        // Micrometer 1.1.0 的暂停监听器强引用 Timer，remove 不会注销；明细指标频繁淘汰/重建时会持续保留。
+        Timer meter = builder.pauseDetector(new NoPauseDetector()).register(meterRegistry);
         // 记录 Timer 注册结果及是否复用了 Registry 中的同 ID Meter。
         if (DETAIL_LOG.isTraceEnabled()) {
             DETAIL_LOG.trace("druid detail meter add: action=register type=timer registryExistedBefore={} meter={}",
