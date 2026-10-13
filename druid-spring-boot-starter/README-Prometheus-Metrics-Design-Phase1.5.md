@@ -6,6 +6,81 @@
 
 1.5 期仅解决一期高基数 SQL/URI 明细 Meter 的生命周期问题：从每天 00:00 开始，每经过配置的 `n` 小时清理一次 Starter 持有的一期明细 Meter 和 identity/LRU 引用，使其生命周期由整个 JVM 运行期收敛到 `n` 小时。该改造不引入二期低基数指标或结构化日志；二期设计继续见 [二期设计](README-Prometheus-Metrics-Design-Phase2.md)。
 
+## 明细 Timer 暂停检测与资源释放
+
+本仓库解析出的依赖为 Micrometer 1.1.0 / LatencyUtils 2.0.3；应用提供的生产依赖版本需另行核实。Micrometer 1.1.0 默认启用暂停检测，每个 Timer 创建一个 `TimeCappedMovingAverageIntervalEstimator`（下文简称 Estimator），并向共享的 `SimplePauseDetector` 注册暂停补偿 listener。
+
+### 完整引用关系
+
+以下 `→` 表示强引用，`⇢` 表示弱引用。①和②中的 `MeterRegistry`、`PrometheusMeterRegistry` 是同一个 Registry 对象：`PrometheusMeterRegistry` 是 `MeterRegistry` 的具体实现，两条路径分别经过它持有的 `meterMap` 和 `collectorMap`。③中的 `SimplePauseDetector` 是另一种对象，不是 Registry。
+
+```text
+① Registry 的引用
+MeterRegistry
+    → meterMap
+    → PrometheusTimer
+
+② Prometheus 导出层的引用
+PrometheusMeterRegistry
+    → collectorMap
+    → MicrometerCollector
+    → children 集合
+    → child（lambda）
+    → PrometheusTimer
+
+③ 暂停检测器的引用——已移除 Timer 仍被保留的关键路径
+AbstractTimer 的静态 pauseDetectorCache
+    → SimplePauseDetector
+    → normalPriorityListeners 集合
+    → 暂停补偿 listener（lambda）
+    → PrometheusTimer
+
+④ Timer 对 Estimator 的引用
+PrometheusTimer
+    → intervalEstimator 字段
+    → TimeCappedMovingAverageIntervalEstimator
+    → 三个 long[]（一个 long[128]、两个 long[32]）
+
+⑤ Estimator 自身的暂停监听器
+SimplePauseDetector
+    → highPriorityListeners 集合
+    → PauseTracker
+    ⇢ TimeCappedMovingAverageIntervalEstimator（弱引用）
+```
+
+③中的暂停补偿 listener 使用 Timer 的实例字段及实例方法，因此 lambda 捕获并强引用 `PrometheusTimer`。⑤中的 `PauseTracker` 继承 `WeakReference`，它对 Estimator 的弱引用本身不会阻止 Estimator 回收；不能把两类 listener 的引用性质混为一谈。
+
+### 清理操作分别断开哪条路径
+
+| 操作 | 断开的引用 | 仍然存在的引用 |
+| --- | --- | --- |
+| `MeterRegistry.remove(timer)` | 从①的 `meterMap` 中移除 Timer | ②的 collector child 和③的暂停补偿 listener 仍可引用 Timer |
+| Starter 清理 collector children | 从②中移除引用 Timer 的 child | ③的暂停补偿 listener 仍引用 Timer |
+| `Estimator.stop()` | 注销⑤中的高优先级 `PauseTracker` | ③的暂停补偿 listener 仍引用 Timer，Timer 仍持有 Estimator |
+| `Timer.close()`（Micrometer 1.1.0） | 关闭 histogram、停止共享的 `SimplePauseDetector` 线程 | 不删除 listener、不清空静态缓存，③和④的强引用仍存在 |
+
+因此，即使 Registry 和 Prometheus 导出层都已清理，仍有完整的强引用链：
+
+```text
+AbstractTimer 的静态 pauseDetectorCache
+    → SimplePauseDetector
+    → normalPriorityListeners 集合
+    → 暂停补偿 listener
+    → PrometheusTimer
+    → TimeCappedMovingAverageIntervalEstimator
+    → 三个 long[]
+```
+
+这条链使已移除的 Timer 及其 Estimator 无法回收。后续事件再次创建 Timer，又增加一组对象；LRU 和周期清理可以限制当前注册的指标数量，却不能限制沿这条链保留的历史对象数量。直接补 `Timer.close()` 不能切断保留链，还会停止其他 Timer 共用的暂停检测器，不能作为本版本的单 Meter 释放修复。
+
+### 本次修复的作用
+
+Starter 在统一注册入口为 SQL/URI 明细 Timer 显式设置 `NoPauseDetector`，使新建 Timer 不再建立③中的暂停补偿 listener 引用，也不再创建④中的 Estimator 和⑤中的 PauseTracker。①和②仍正常建立，并由原有 LRU、周期清理及 collector child 清理逻辑移除。
+
+实际事件的耗时、次数及分布统计继续记录，但不再加入暂停补偿样本。配置仅作用于 Druid 明细 Timer，不修改应用 Registry 的暂停检测配置。
+
+同 ID 的已注册 Timer 会被 Micrometer 复用，修改 builder 不会重配旧 Timer，也不会释放已被静态缓存中的 detector 保留的历史对象。部署本修复后应重启应用进程。回归测试使用实际 Prometheus Registry，重复执行 SQL/URI 创建、LRU 淘汰、清理和重建，验证 Timer 没有暂停资源，并检查计时及 Prometheus 暴露层行为。
+
 ## 范围与边界
 
 清理范围严格限定为 Starter 自己注册的一期 SQL/URI 明细 Timer 和 DistributionSummary，以及与这些 Meter 对应的 SQL/URI identity 表、近似 LRU 元数据、注册句柄和 PENDING 状态。
